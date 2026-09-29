@@ -6,7 +6,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed --name Automation
     --distpath outputs --workpath build --specpath build ^
     --add-data "%~dp0.agents\skills\supplier-discovery\SKILL.md;.agents\skills\supplier-discovery" ^
     --add-data "%~dp0automation\windows_ocr.ps1;automation" ^
-    --hidden-import pdfplumber --hidden-import pypdfium2 ^
+    --hidden-import pdfplumber --hidden-import pypdfium2 --hidden-import truststore ^
     main.py || goto :error
 echo.
 echo Готово: outputs\Automation.exe

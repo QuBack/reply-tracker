@@ -153,11 +153,26 @@ def iter_named_attachments(message: Message) -> Iterable[tuple[str, str, bytes]]
         yield filename, part.get_content_type() or "application/octet-stream", payload
 
 
+def create_ssl_context() -> ssl.SSLContext:
+    """Проверяет сертификаты средствами Windows, как это делает браузер.
+
+    Стандартный контекст Python видит только корневые сертификаты, уже лежащие
+    в хранилище Windows, и не догружает недостающие, а также не доверяет
+    сертификатам антивируса, проверяющего почту. Отсюда ошибка
+    CERTIFICATE_VERIFY_FAILED на части компьютеров.
+    """
+    try:
+        import truststore
+    except ImportError:
+        return ssl.create_default_context()
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
 class MailGateway:
     def __init__(self, settings: MailSettings, timeout: int = 30) -> None:
         self.settings = settings
         self.timeout = timeout
-        self.ssl_context = ssl.create_default_context()
+        self.ssl_context = create_ssl_context()
 
     def test_connection(self) -> None:
         smtp = smtplib.SMTP_SSL(

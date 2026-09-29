@@ -18,7 +18,7 @@ echo   OK: %PY%
 
 echo.
 echo [2/4] Библиотеки
-"%PY%" -c "import openpyxl, pdfplumber, pypdfium2" >nul 2>&1
+"%PY%" -c "import openpyxl, pdfplumber, pypdfium2, truststore" >nul 2>&1
 if not errorlevel 1 goto :libs_ok
 echo   Устанавливаю библиотеки...
 "%PY%" -m pip install --disable-pip-version-check --upgrade -r requirements.txt
