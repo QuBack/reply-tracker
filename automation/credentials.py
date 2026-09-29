@@ -32,8 +32,13 @@ class WindowsCredentialStore:
     CRED_TYPE_GENERIC = 1
     CRED_PERSIST_LOCAL_MACHINE = 2
 
-    def __init__(self, target: str = "RosaMailCollector/MailRu") -> None:
+    DEFAULT_TARGET = "AutomationSystem/MailRu"
+    # Под этим именем пароль сохраняли прежние версии приложения.
+    LEGACY_TARGET = "RosaMailCollector/MailRu"
+
+    def __init__(self, target: str = DEFAULT_TARGET) -> None:
         self.target = target
+        self.legacy_target = self.LEGACY_TARGET if target == self.DEFAULT_TARGET else None
         if os.name != "nt":
             raise CredentialError("Хранилище паролей поддерживается только в Windows")
         self._advapi32 = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
@@ -59,7 +64,7 @@ class WindowsCredentialStore:
         credential = _CredentialW()
         credential.Type = self.CRED_TYPE_GENERIC
         credential.TargetName = self.target
-        credential.Comment = "Пароль внешнего приложения Mail.ru для Rosa Mail Collector"
+        credential.Comment = "Пароль внешнего приложения Mail.ru для системы автоматизации"
         credential.CredentialBlobSize = len(blob)
         credential.CredentialBlob = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte))
         credential.Persist = self.CRED_PERSIST_LOCAL_MACHINE
@@ -68,9 +73,18 @@ class WindowsCredentialStore:
             raise CredentialError(f"Не удалось сохранить пароль, код Windows: {ctypes.get_last_error()}")
 
     def read(self) -> tuple[str, str] | None:
+        stored = self._read_target(self.target)
+        if stored is None and self.legacy_target:
+            stored = self._read_target(self.legacy_target)
+            if stored is not None:
+                self.write(*stored)
+                self._delete_target(self.legacy_target)
+        return stored
+
+    def _read_target(self, target: str) -> tuple[str, str] | None:
         pointer = ctypes.POINTER(_CredentialW)()
         ok = self._advapi32.CredReadW(
-            self.target,
+            target,
             self.CRED_TYPE_GENERIC,
             0,
             ctypes.byref(pointer),
@@ -88,7 +102,12 @@ class WindowsCredentialStore:
             self._advapi32.CredFree(pointer)
 
     def delete(self) -> None:
-        ok = self._advapi32.CredDeleteW(self.target, self.CRED_TYPE_GENERIC, 0)
+        self._delete_target(self.target)
+        if self.legacy_target:
+            self._delete_target(self.legacy_target)
+
+    def _delete_target(self, target: str) -> None:
+        ok = self._advapi32.CredDeleteW(target, self.CRED_TYPE_GENERIC, 0)
         if not ok:
             error = ctypes.get_last_error()
             if error != 1168:

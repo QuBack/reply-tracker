@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from rosa_mail.summary import OfferSource, build_summary
+from automation.summary import OfferSource, build_summary
 
 
 def main() -> int:

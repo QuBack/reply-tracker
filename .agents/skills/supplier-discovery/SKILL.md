@@ -1,6 +1,6 @@
 ---
 name: supplier-discovery
-description: Find real companies that supply requested industrial goods, verify their public contact details, and classify them for a supplier directory. Use for supplier discovery requests from the Rosa Mail application.
+description: Find real companies that supply requested industrial goods, verify their public contact details, and classify them for a supplier directory. Use for supplier discovery requests from the automation application.
 ---
 
 # Supplier discovery

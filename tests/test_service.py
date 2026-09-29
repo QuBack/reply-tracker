@@ -9,11 +9,11 @@ from email.parser import BytesParser
 from pathlib import Path
 from unittest.mock import patch
 
-from rosa_mail.database import Database
-from rosa_mail.mail_gateway import MailGateway
-from rosa_mail.paths import AppPaths
-from rosa_mail.service import AppService
-from rosa_mail.ui import incoming_result_label
+from automation.database import Database
+from automation.mail_gateway import MailGateway
+from automation.paths import AppPaths
+from automation.service import AppService
+from automation.ui import incoming_result_label
 
 
 class DummyCredentialStore:
@@ -170,7 +170,7 @@ class ServiceIncomingTests(unittest.TestCase):
             yield "offer.pdf", "application/pdf", b"%PDF-test"
             raise OSError("Диск временно недоступен")
 
-        with patch("rosa_mail.service.iter_named_attachments", interrupted_parts):
+        with patch("automation.service.iter_named_attachments", interrupted_parts):
             with self.assertRaises(OSError):
                 self.service._process_incoming(
                     mailbox="buyer@mail.ru", folder="INBOX", uid_validity="42",
@@ -196,7 +196,7 @@ class ServiceIncomingTests(unittest.TestCase):
         recipient_id = int(self.db.list_recipients(campaign_id)[0]["id"])
         actual_build = MailGateway(self.service.mail_settings()).build_message
 
-        with patch("rosa_mail.service.MailGateway") as gateway_class:
+        with patch("automation.service.MailGateway") as gateway_class:
             gateway = gateway_class.return_value
             gateway.build_message.side_effect = actual_build
             gateway.smtp_session.return_value.__enter__.return_value.send_message.side_effect = (
@@ -224,7 +224,7 @@ class ServiceIncomingTests(unittest.TestCase):
         recipient_id = int(self.db.list_recipients(campaign_id)[0]["id"])
         actual_build = MailGateway(self.service.mail_settings()).build_message
 
-        with patch("rosa_mail.service.MailGateway") as gateway_class:
+        with patch("automation.service.MailGateway") as gateway_class:
             gateway = gateway_class.return_value
             gateway.build_message.side_effect = actual_build
             first = self.service.send_campaign(campaign_id)
@@ -254,7 +254,7 @@ class ServiceIncomingTests(unittest.TestCase):
         recipient_id = int(self.db.list_recipients(campaign_id)[0]["id"])
         actual_build = MailGateway(self.service.mail_settings()).build_message
 
-        with patch("rosa_mail.service.MailGateway") as gateway_class:
+        with patch("automation.service.MailGateway") as gateway_class:
             gateway = gateway_class.return_value
             gateway.build_message.side_effect = actual_build
             send = gateway.smtp_session.return_value.__enter__.return_value.send_message
@@ -280,7 +280,7 @@ class ServiceIncomingTests(unittest.TestCase):
                               excluded=True, excluded_reason="Попросили не писать")
         actual_build = MailGateway(self.service.mail_settings()).build_message
 
-        with patch("rosa_mail.service.MailGateway") as gateway_class:
+        with patch("automation.service.MailGateway") as gateway_class:
             gateway = gateway_class.return_value
             gateway.build_message.side_effect = actual_build
             send = gateway.smtp_session.return_value.__enter__.return_value.send_message
@@ -302,7 +302,7 @@ class ServiceIncomingTests(unittest.TestCase):
         )
         actual_build = MailGateway(self.service.mail_settings()).build_message
 
-        with patch("rosa_mail.service.MailGateway") as gateway_class:
+        with patch("automation.service.MailGateway") as gateway_class:
             gateway = gateway_class.return_value
             gateway.build_message.side_effect = actual_build
             send = gateway.smtp_session.return_value.__enter__.return_value.send_message

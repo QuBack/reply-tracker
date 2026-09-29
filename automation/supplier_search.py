@@ -154,16 +154,25 @@ def _output_schema() -> dict:
 
 
 def find_codex_executable() -> str | None:
+    # Нужен именно codex.exe: обёртка codex.cmd из npm проходит через cmd.exe,
+    # который обрезает многострочный запрос.
     direct = shutil.which("codex")
-    if direct:
+    if direct and direct.lower().endswith(".exe"):
         return direct
+    candidates: list[Path] = []
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
-        install_root = Path(local_app_data) / "OpenAI" / "Codex" / "bin"
-        installed = list(install_root.glob("*/codex.exe"))
-        if installed:
-            return str(max(installed, key=lambda path: path.stat().st_mtime))
-    return None
+        candidates += (Path(local_app_data) / "OpenAI" / "Codex" / "bin").glob("*/codex.exe")
+    npm_roots = [Path(direct).parent] if direct else []
+    if os.environ.get("APPDATA"):
+        npm_roots.append(Path(os.environ["APPDATA"]) / "npm")
+    for root in npm_roots:
+        candidates += (root / "node_modules" / "@openai" / "codex").glob(
+            "node_modules/@openai/codex-win32-*/vendor/*/bin/codex.exe"
+        )
+    if candidates:
+        return str(max(candidates, key=lambda path: path.stat().st_mtime))
+    return direct
 
 
 def run_codex_search(query: str, region: str, known_categories: list[str], *,

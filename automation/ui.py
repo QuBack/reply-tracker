@@ -71,12 +71,12 @@ def display_datetime(value: str | None) -> str:
         return value
 
 
-class RosaMailApp(tk.Tk):
+class AutomationApp(tk.Tk):
     def __init__(self, service: AppService, database: Database) -> None:
         super().__init__()
         self.service = service
         self.db = database
-        self.title("Роза — сбор предложений")
+        self.title("Система автоматизации")
         self.geometry("1220x790")
         self.minsize(980, 660)
         self.protocol("WM_DELETE_WINDOW", self._minimize_window)
@@ -120,7 +120,7 @@ class RosaMailApp(tk.Tk):
         header.pack_propagate(False)
         tk.Label(
             header,
-            text="Роза  •  Коммерческие предложения",
+            text="Система автоматизации",
             bg="#17324d",
             fg="white",
             font=("Segoe UI Semibold", 16),

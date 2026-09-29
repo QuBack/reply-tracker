@@ -562,7 +562,7 @@ def _write_workbook(result: SummaryResult) -> None:
 
     last_col = 5 + 4 * len(result.suppliers)
     summary.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
-    summary.cell(1, 1, "Сводная коммерческих предложений")
+    summary.cell(1, 1, "Сводная предложений поставщиков")
     summary.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
     summary.cell(2, 1, "Цены за 1000 кг с НДС. Предложенные объёмы могут отличаться от заявки.")
     summary.merge_cells(start_row=3, start_column=1, end_row=3, end_column=last_col)

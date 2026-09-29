@@ -6,7 +6,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 
-from rosa_mail.summary import OfferSource, _check_invoice_total, build_summary, read_invoice, read_request
+from automation.summary import OfferSource, _check_invoice_total, build_summary, read_invoice, read_request
 
 
 FILES = {
@@ -21,7 +21,7 @@ FILES = {
 
 
 def fixtures() -> dict[str, Path]:
-    root = Path(os.environ.get("ROSA_SUMMARY_FIXTURES_DIR", Path.home() / "Downloads"))
+    root = Path(os.environ.get("SUMMARY_FIXTURES_DIR", Path.home() / "Downloads"))
     return {key: root / filename for key, filename in FILES.items()}
 
 
@@ -126,9 +126,9 @@ class SummaryFixtureTests(unittest.TestCase):
     def test_service_uses_only_selected_campaign_files(self) -> None:
         from openpyxl import load_workbook
 
-        from rosa_mail.database import Database
-        from rosa_mail.paths import AppPaths
-        from rosa_mail.service import AppService
+        from automation.database import Database
+        from automation.paths import AppPaths
+        from automation.service import AppService
 
         class NoCredentials:
             pass

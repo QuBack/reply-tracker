@@ -5,7 +5,7 @@ from datetime import date
 from email.message import EmailMessage
 from unittest.mock import patch
 
-from rosa_mail.mail_gateway import MailGateway, MailSettings
+from automation.mail_gateway import MailGateway, MailSettings
 
 
 class FakeImap:
@@ -48,7 +48,7 @@ class MailGatewayFetchTests(unittest.TestCase):
 
     def test_failed_fetch_does_not_advance_cursor_past_missing_message(self) -> None:
         fake = FakeImap(uids=b"101 102 103", failed_uid=102)
-        with patch("rosa_mail.mail_gateway.imaplib.IMAP4_SSL", return_value=fake):
+        with patch("automation.mail_gateway.imaplib.IMAP4_SSL", return_value=fake):
             result = self.gateway.fetch_new_messages(
                 last_uid=100, previous_uid_validity="42", since=date(2026, 9, 1)
             )
@@ -57,7 +57,7 @@ class MailGatewayFetchTests(unittest.TestCase):
 
     def test_empty_initial_search_uses_uidnext_from_before_search(self) -> None:
         fake = FakeImap(uids=b"", uid_next=500)
-        with patch("rosa_mail.mail_gateway.imaplib.IMAP4_SSL", return_value=fake):
+        with patch("automation.mail_gateway.imaplib.IMAP4_SSL", return_value=fake):
             result = self.gateway.fetch_new_messages(
                 last_uid=0, previous_uid_validity=None, since=date(2026, 9, 1)
             )

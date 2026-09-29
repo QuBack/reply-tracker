@@ -3,8 +3,8 @@ from __future__ import annotations
 import logging
 import sys
 
-from rosa_mail.paths import AppPaths
-from rosa_mail.tk_runtime import prepare_tk_runtime
+from automation.paths import AppPaths
+from automation.tk_runtime import prepare_tk_runtime
 
 
 def configure_logging(paths: AppPaths) -> None:
@@ -25,15 +25,15 @@ def main() -> int:
         import tkinter as tk
         from tkinter import messagebox
 
-        from rosa_mail.credentials import WindowsCredentialStore
-        from rosa_mail.database import Database
-        from rosa_mail.service import AppService
-        from rosa_mail.ui import RosaMailApp
+        from automation.credentials import WindowsCredentialStore
+        from automation.database import Database
+        from automation.service import AppService
+        from automation.ui import AutomationApp
 
         database = Database(paths.database)
         credentials = WindowsCredentialStore()
         service = AppService(paths, database, credentials)
-        app = RosaMailApp(service, database)
+        app = AutomationApp(service, database)
         app.mainloop()
         return 0
     except Exception as exc:

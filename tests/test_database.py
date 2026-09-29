@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from rosa_mail.database import Database
+from automation.database import Database
 
 
 class DatabaseTests(unittest.TestCase):

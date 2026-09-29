@@ -1,4 +1,4 @@
-# Роза — состояние проекта и план продолжения
+# Система автоматизации — состояние проекта и план продолжения
 
 Актуально на **24 сентября 2026 года**. План обязательных проверок вынесен в
 `TEST_PLAN.md`.
@@ -74,10 +74,10 @@
 ```text
 .
 ├── main.py                         # точка запуска
-├── run.bat                         # запуск без консольного окна
+├── start.bat                       # установка недостающего и запуск
 ├── README.md                       # инструкция пользователя
 ├── NEXT_STEPS.md                   # этот файл
-├── rosa_mail/
+├── automation/
 │   ├── credentials.py              # Windows Credential Manager
 │   ├── database.py                 # схема SQLite и запросы
 │   ├── mail_gateway.py             # IMAP/SMTP и разбор MIME
@@ -96,7 +96,7 @@
 Рабочая папка:
 
 ```text
-C:\Users\USER\Documents\Скрипт ПО для Розы
+C:\путь\к\проекту
 ```
 
 Запуск:
@@ -105,7 +105,7 @@ C:\Users\USER\Documents\Скрипт ПО для Розы
 python main.py
 ```
 
-Либо двойной щелчок по `run.bat`.
+Либо двойной щелчок по `start.bat`.
 
 Тесты:
 
@@ -116,7 +116,7 @@ python -m unittest discover -s tests -v
 Проверка синтаксиса:
 
 ```powershell
-python -m compileall -q main.py rosa_mail tests
+python -m compileall -q main.py automation tests
 ```
 
 Последний локальный результат: **19 тестов успешно**. Ранее окно создавалось, в
@@ -128,13 +128,13 @@ python -m compileall -q main.py rosa_mail tests
 По умолчанию:
 
 ```text
-%LOCALAPPDATA%\RosaMailCollector
+%LOCALAPPDATA%\AutomationSystem
 ```
 
 Основные элементы:
 
 ```text
-RosaMailCollector/
+AutomationSystem/
 ├── app.db
 ├── campaigns/
 ├── unmatched/
@@ -146,7 +146,7 @@ RosaMailCollector/
 Для разработки можно перенаправить данные во временную папку:
 
 ```powershell
-$env:ROSA_MAIL_DATA_DIR = "C:\Temp\RosaMailTestData"
+$env:AUTOMATION_DATA_DIR = "C:\Temp\AutomationTestData"
 python main.py
 ```
 

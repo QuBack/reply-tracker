@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from rosa_mail.database import Database
-from rosa_mail.supplier_search import (Candidate, candidate_identity, export_candidates_xlsx,
+from automation.database import Database
+from automation.supplier_search import (Candidate, candidate_identity, export_candidates_xlsx,
                                        parse_codex_result)
 
 

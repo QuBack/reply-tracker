@@ -4,7 +4,7 @@ import unittest
 from email import policy
 from email.parser import BytesParser
 
-from rosa_mail.mail_gateway import (
+from automation.mail_gateway import (
     extract_message_text,
     message_reference_ids,
     subject_campaign_code,

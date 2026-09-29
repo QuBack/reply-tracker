@@ -5,6 +5,19 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+DATA_DIR_NAME = "AutomationSystem"
+# Папка прежних версий. База хранит абсолютные пути к письмам и вложениям,
+# поэтому существующую папку не переименовываем, а продолжаем использовать.
+LEGACY_DATA_DIR_NAME = "RosaMailCollector"
+LEGACY_DATA_DIR_ENV = "ROSA_MAIL_DATA_DIR"
+
+
+def _adopt_legacy_folder(legacy: Path, current: Path) -> Path:
+    if not current.exists() and legacy.is_dir():
+        return legacy
+    return current
+
+
 @dataclass(frozen=True)
 class AppPaths:
     root: Path
@@ -16,13 +29,13 @@ class AppPaths:
 
     @classmethod
     def discover(cls) -> "AppPaths":
-        override = os.environ.get("ROSA_MAIL_DATA_DIR")
+        override = os.environ.get("AUTOMATION_DATA_DIR") or os.environ.get(LEGACY_DATA_DIR_ENV)
         if override:
             root = Path(override).expanduser().resolve()
         else:
             local_app_data = os.environ.get("LOCALAPPDATA")
             base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
-            root = base / "RosaMailCollector"
+            root = _adopt_legacy_folder(base / LEGACY_DATA_DIR_NAME, base / DATA_DIR_NAME)
         return cls.from_root(root)
 
     @classmethod

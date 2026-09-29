@@ -208,7 +208,7 @@ class MailGateway:
         message["Date"] = formatdate(localtime=True)
         domain = self.settings.email_address.rsplit("@", 1)[-1]
         message["Message-ID"] = make_msgid(idstring=campaign_code, domain=domain)
-        message["X-Rosa-Campaign-ID"] = campaign_code
+        message["X-Campaign-ID"] = campaign_code
         message.set_content(body)
         for path in attachment_paths:
             payload = path.read_bytes()

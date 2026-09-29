@@ -585,7 +585,7 @@ class AppService:
 
     def create_backup(self) -> OperationResult:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        archive = self.paths.backups / f"rosa-mail-backup-{timestamp}.zip"
+        archive = self.paths.backups / f"backup-{timestamp}.zip"
         snapshot = self.paths.backups / f"app-{timestamp}.db"
         self.db.backup_to(snapshot)
         try:
