@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+build/
+dist/
+*.spec
+.dev-data/
+
+# Собранные exe, выгрузки и рабочие таблицы
+outputs/
+*.exe
+
+# Базы и письма с реальными данными
+*.db
+*.db-wal
+*.db-shm
+*.eml
+
+# Резервные копии и посторонние материалы
+.*_backup_*/
+_pr5_work/
+Готовые_документы/
