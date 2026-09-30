@@ -16,7 +16,8 @@ from urllib.parse import urlsplit
 
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-SEARCH_TIMEOUT_SECONDS = 600
+SEARCH_TIMEOUT_SECONDS = 1200
+MAX_COMPANIES = 50
 SEARCH_MODEL = "gpt-6-sol"
 REASONING_EFFORT = "low"
 
@@ -91,7 +92,7 @@ def parse_codex_result(payload: str) -> SearchResult:
     candidates: list[Candidate] = []
     rejected = 0
     seen: set[str] = set()
-    for raw in document["candidates"][:25]:
+    for raw in document["candidates"][:MAX_COMPANIES]:
         try:
             if not isinstance(raw, dict):
                 raise ValueError("Нет карточки компании")
@@ -187,8 +188,8 @@ def run_codex_search(query: str, region: str, known_categories: list[str], *,
         raise ValueError("Опишите искомых поставщиков подробнее (от 5 до 600 символов)")
     if len(region) > 150:
         raise ValueError("Слишком длинное название региона")
-    if not 1 <= maximum_companies <= 25:
-        raise ValueError("Количество компаний должно быть от 1 до 25")
+    if not 1 <= maximum_companies <= MAX_COMPANIES:
+        raise ValueError(f"Количество компаний должно быть от 1 до {MAX_COMPANIES}")
     codex = executable or find_codex_executable()
     if not codex:
         raise RuntimeError("Codex CLI не найден. Установите Codex и войдите через ChatGPT Plus.")

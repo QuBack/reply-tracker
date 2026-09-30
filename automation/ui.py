@@ -294,7 +294,7 @@ class AutomationApp(tk.Tk):
         self.search_limit_var = tk.StringVar(value="10")
         ttk.Combobox(
             request, textvariable=self.search_limit_var, state="readonly", width=5,
-            values=("5", "10", "15", "20", "25"),
+            values=("5", "10", "15", "20", "25", "30", "40", "50"),
         ).grid(row=2, column=1, padx=(8, 4))
         self.search_start_button = ttk.Button(
             request, text="Найти", command=self._start_supplier_search

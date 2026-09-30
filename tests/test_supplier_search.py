@@ -7,8 +7,9 @@ import unittest
 from pathlib import Path
 
 from automation.database import Database
-from automation.supplier_search import (Candidate, candidate_identity, export_candidates_xlsx,
-                                       parse_codex_result)
+from automation.supplier_search import (MAX_COMPANIES, Candidate, candidate_identity,
+                                       export_candidates_xlsx, parse_codex_result,
+                                       run_codex_search)
 
 
 def sample_candidate(**overrides: object) -> Candidate:
@@ -123,6 +124,23 @@ class SupplierSearchTests(unittest.TestCase):
         self.assertEqual(len(result.candidates), 1)
         self.assertEqual(result.rejected_count, 2)
         self.assertIn(valid["contact_source_url"], result.candidates[0].source_urls)
+
+    def test_parser_keeps_up_to_fifty_companies(self) -> None:
+        valid = sample_candidate().__dict__
+        candidates = [
+            {**valid, "name": f"Компания {i}", "website": f"https://c{i}.example.ru",
+             "email": f"sales@c{i}.example.ru", "contact_source_url": f"https://c{i}.example.ru/contacts",
+             "source_urls": [f"https://c{i}.example.ru/catalog"]}
+            for i in range(MAX_COMPANIES + 5)
+        ]
+        result = parse_codex_result(json.dumps({"candidates": candidates}))
+        self.assertEqual(MAX_COMPANIES, 50)
+        self.assertEqual(len(result.candidates), 50)
+
+    def test_search_rejects_more_than_fifty_companies(self) -> None:
+        with self.assertRaisesRegex(ValueError, "от 1 до 50"):
+            run_codex_search("гидроцилиндры", "Россия", [], project_root=Path(self.temp.name),
+                             data_root=Path(self.temp.name), maximum_companies=51)
 
     def test_identity_uses_site_before_email(self) -> None:
         first = candidate_identity("Завод", "https://www.gidro.example.ru/catalog", "", "Россия")
