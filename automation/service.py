@@ -16,6 +16,8 @@ from typing import Iterable
 from .credentials import WindowsCredentialStore
 from .database import Database, utc_now
 from .mail_gateway import (
+    DEFAULT_MAIL_PROVIDER,
+    MAIL_PROVIDERS,
     MailGateway,
     MailSettings,
     decode_header_value,
@@ -97,30 +99,49 @@ class AppService:
     def get_mail_preferences(self) -> dict[str, str]:
         return {
             "email_address": self.db.get_setting("email_address"),
+            "mail_provider": self._mail_provider_key(),
             "check_interval_minutes": self.db.get_setting("check_interval_minutes", "10"),
             "has_password": "1" if self.credentials.has_secret() else "0",
         }
 
+    def _mail_provider_key(self) -> str:
+        key = self.db.get_setting("mail_provider", DEFAULT_MAIL_PROVIDER)
+        # Базы, созданные до выбора почты, работали только с Mail.ru.
+        return key if key in MAIL_PROVIDERS else DEFAULT_MAIL_PROVIDER
+
     def save_mail_preferences(
-        self, email_address: str, check_interval_minutes: int, password: str = ""
+        self,
+        email_address: str,
+        check_interval_minutes: int,
+        password: str = "",
+        mail_provider: str | None = None,
     ) -> None:
         email_address = email_address.strip().lower()
         if "@" not in email_address or email_address.startswith("@"):
-            raise ValueError("Введите корректный адрес Mail.ru")
+            raise ValueError("Введите корректный адрес почты")
         if check_interval_minutes not in (5, 10, 15, 30, 60):
             raise ValueError("Недопустимый интервал проверки")
+        current_provider = self._mail_provider_key()
+        mail_provider = mail_provider or current_provider
+        if mail_provider not in MAIL_PROVIDERS:
+            raise ValueError("Неизвестный почтовый сервис")
         current = self.credentials.read()
         if not password and current and current[0].lower() != email_address:
-            raise ValueError("При смене почтового адреса нужно заново указать пароль приложения")
+            raise ValueError("При смене почтового адреса нужно заново указать пароль")
+        if not password and current and mail_provider != current_provider:
+            raise ValueError("При смене почтового сервиса нужно заново указать пароль")
         self.db.set_settings(
             {
                 "email_address": email_address,
+                "mail_provider": mail_provider,
                 "check_interval_minutes": str(check_interval_minutes),
             }
         )
         if password:
             self.credentials.write(email_address, password)
-        self.db.log("info", "mail_settings_saved", None, {"email": email_address})
+        self.db.log(
+            "info", "mail_settings_saved", None, {"email": email_address, "provider": mail_provider}
+        )
 
     def delete_saved_password(self) -> None:
         self.credentials.delete()
@@ -132,17 +153,18 @@ class AppService:
         if not email_address:
             raise ValueError("Сначала укажите адрес почты в Настройках")
         if not credential:
-            raise ValueError("Сначала сохраните пароль внешнего приложения Mail.ru")
+            raise ValueError("Сначала сохраните пароль почты в Настройках")
         username, password = credential
         if username.lower() != email_address:
             raise ValueError("Сохранённый пароль относится к другому почтовому адресу")
-        return MailSettings(email_address=email_address, password=password)
+        return MailSettings.for_provider(self._mail_provider_key(), email_address, password)
 
     def test_mail_connection(self) -> OperationResult:
         with self._mail_lock:
             MailGateway(self.mail_settings()).test_connection()
         self.db.log("info", "mail_connection_tested", None, {"status": "ok"})
-        return OperationResult("Подключение к Mail.ru успешно", {})
+        provider = MAIL_PROVIDERS[self._mail_provider_key()]
+        return OperationResult(f"Подключение к {provider.title} успешно", {})
 
     def create_and_send_campaign(
         self,

@@ -332,5 +332,64 @@ class ServiceIncomingTests(unittest.TestCase):
         self.assertEqual([Path(row["path"]) for row in outgoing], [saved_request])
 
 
+class MemoryCredentialStore:
+    def __init__(self, username: str | None = None, password: str | None = None) -> None:
+        self.value = (username, password) if username else None
+
+    def read(self):
+        return self.value
+
+    def write(self, username, password):
+        self.value = (username, password)
+
+    def has_secret(self):
+        return self.value is not None
+
+
+class MailProviderSettingsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.paths = AppPaths.from_root(Path(self.temp.name))
+        self.db = Database(self.paths.database)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_existing_setup_defaults_to_mailru(self) -> None:
+        service = AppService(self.paths, self.db, MemoryCredentialStore("buyer@mail.ru", "secret"))
+        self.db.set_settings({"email_address": "buyer@mail.ru"})
+
+        settings = service.mail_settings()
+
+        self.assertEqual(service.get_mail_preferences()["mail_provider"], "mailru")
+        self.assertEqual((settings.imap_host, settings.smtp_host), ("imap.mail.ru", "smtp.mail.ru"))
+
+    def test_timeweb_uses_timeweb_servers(self) -> None:
+        service = AppService(self.paths, self.db, MemoryCredentialStore())
+        service.save_mail_preferences("Buyer@Company.ru", 10, "secret", "timeweb")
+
+        settings = service.mail_settings()
+
+        self.assertEqual(settings.email_address, "buyer@company.ru")
+        self.assertEqual((settings.imap_host, settings.imap_port), ("imap.timeweb.ru", 993))
+        self.assertEqual((settings.smtp_host, settings.smtp_port), ("smtp.timeweb.ru", 465))
+
+    def test_changing_provider_requires_password(self) -> None:
+        service = AppService(self.paths, self.db, MemoryCredentialStore())
+        service.save_mail_preferences("buyer@company.ru", 10, "secret", "mailru")
+
+        with self.assertRaises(ValueError):
+            service.save_mail_preferences("buyer@company.ru", 10, "", "timeweb")
+        service.save_mail_preferences("buyer@company.ru", 15, "", "mailru")
+
+        self.assertEqual(service.get_mail_preferences()["check_interval_minutes"], "15")
+
+    def test_unknown_provider_is_rejected(self) -> None:
+        service = AppService(self.paths, self.db, MemoryCredentialStore())
+
+        with self.assertRaises(ValueError):
+            service.save_mail_preferences("buyer@company.ru", 10, "secret", "gmail")
+
+
 if __name__ == "__main__":
     unittest.main()

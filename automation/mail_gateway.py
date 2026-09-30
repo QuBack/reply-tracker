@@ -22,6 +22,23 @@ MESSAGE_ID_RE = re.compile(r"<[^<>\s]+>")
 
 
 @dataclass(frozen=True)
+class MailProvider:
+    key: str
+    title: str
+    imap_host: str
+    smtp_host: str
+    imap_port: int = 993
+    smtp_port: int = 465
+
+
+MAIL_PROVIDERS: dict[str, MailProvider] = {
+    "mailru": MailProvider("mailru", "Mail.ru", "imap.mail.ru", "smtp.mail.ru"),
+    "timeweb": MailProvider("timeweb", "Timeweb", "imap.timeweb.ru", "smtp.timeweb.ru"),
+}
+DEFAULT_MAIL_PROVIDER = "mailru"
+
+
+@dataclass(frozen=True)
 class MailSettings:
     email_address: str
     password: str
@@ -29,6 +46,18 @@ class MailSettings:
     imap_port: int = 993
     smtp_host: str = "smtp.mail.ru"
     smtp_port: int = 465
+
+    @classmethod
+    def for_provider(cls, provider_key: str, email_address: str, password: str) -> "MailSettings":
+        provider = MAIL_PROVIDERS[provider_key]
+        return cls(
+            email_address=email_address,
+            password=password,
+            imap_host=provider.imap_host,
+            imap_port=provider.imap_port,
+            smtp_host=provider.smtp_host,
+            smtp_port=provider.smtp_port,
+        )
 
 
 @dataclass(frozen=True)
@@ -200,7 +229,7 @@ class MailGateway:
             imap.login(self.settings.email_address, self.settings.password)
             status, _ = imap.select("INBOX", readonly=True)
             if status != "OK":
-                raise RuntimeError("Mail.ru не разрешил открыть папку Входящие")
+                raise RuntimeError("Почтовый сервер не разрешил открыть папку Входящие")
         finally:
             try:
                 imap.logout()
@@ -288,7 +317,7 @@ class MailGateway:
             else:
                 status, data = imap.uid("search", None, "SINCE", since.strftime("%d-%b-%Y"))
             if status != "OK":
-                raise RuntimeError("Mail.ru не выполнил поиск новых писем")
+                raise RuntimeError("Почтовый сервер не выполнил поиск новых писем")
             uids = sorted(int(value) for value in (data[0] or b"").split() if value.isdigit())
             envelopes: list[IncomingEnvelope] = []
             first_failed_uid: int | None = None

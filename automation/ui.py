@@ -14,6 +14,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Callable
 
 from .database import Database
+from .mail_gateway import MAIL_PROVIDERS
 from .service import AppService, OperationResult
 from .supplier_search import (SearchCancelled, clean_categories, export_candidates_xlsx,
                               normalize_email, normalize_web_url, run_codex_search)
@@ -633,40 +634,54 @@ class AutomationApp(tk.Tk):
 
     def _build_settings_tab(self) -> None:
         self.settings_tab.columnconfigure(0, weight=1)
-        ttk.Label(self.settings_tab, text="Настройки Mail.ru", style="Header.TLabel").grid(
+        ttk.Label(self.settings_tab, text="Настройки почты", style="Header.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, 12)
         )
         form = ttk.LabelFrame(self.settings_tab, text="Почтовый ящик", padding=16)
         form.grid(row=1, column=0, sticky="ew")
         form.columnconfigure(1, weight=1)
+        self.settings_provider_var = tk.StringVar(value=MAIL_PROVIDERS["mailru"].title)
         self.settings_email_var = tk.StringVar()
         self.settings_password_var = tk.StringVar()
         self.settings_interval_var = tk.StringVar(value="10")
         self.password_state_var = tk.StringVar(value="Пароль не сохранён")
-        ttk.Label(form, text="Адрес Mail.ru").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=5)
-        ttk.Entry(form, textvariable=self.settings_email_var).grid(row=0, column=1, sticky="ew", pady=5)
-        ttk.Label(form, text="Пароль приложения").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=5)
+        self.settings_password_hint_var = tk.StringVar()
+        ttk.Label(form, text="Почтовый сервис").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=5)
+        provider_box = ttk.Combobox(
+            form,
+            textvariable=self.settings_provider_var,
+            values=[provider.title for provider in MAIL_PROVIDERS.values()],
+            state="readonly",
+            width=14,
+        )
+        provider_box.grid(row=0, column=1, sticky="w", pady=5)
+        provider_box.bind("<<ComboboxSelected>>", lambda _event: self._update_password_hint())
+        ttk.Label(form, text="Адрес почты").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=5)
+        ttk.Entry(form, textvariable=self.settings_email_var).grid(row=1, column=1, sticky="ew", pady=5)
+        ttk.Label(form, text="Пароль").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=5)
         ttk.Entry(form, textvariable=self.settings_password_var, show="●").grid(
-            row=1, column=1, sticky="ew", pady=5
+            row=2, column=1, sticky="ew", pady=5
         )
         ttk.Label(
             form,
-            text="Оставьте поле пустым, чтобы не менять уже сохранённый пароль.",
+            textvariable=self.settings_password_hint_var,
             style="Muted.TLabel",
-        ).grid(row=2, column=1, sticky="w")
-        ttk.Label(form, text="Интервал проверки").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=10)
+            wraplength=700,
+            justify="left",
+        ).grid(row=3, column=1, sticky="w")
+        ttk.Label(form, text="Интервал проверки").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=10)
         ttk.Combobox(
             form,
             textvariable=self.settings_interval_var,
             values=("5", "10", "15", "30", "60"),
             state="readonly",
             width=8,
-        ).grid(row=3, column=1, sticky="w", pady=10)
+        ).grid(row=4, column=1, sticky="w", pady=10)
         ttk.Label(form, textvariable=self.password_state_var, style="Muted.TLabel").grid(
-            row=4, column=1, sticky="w"
+            row=5, column=1, sticky="w"
         )
         actions = ttk.Frame(form)
-        actions.grid(row=5, column=0, columnspan=2, sticky="w", pady=(14, 0))
+        actions.grid(row=6, column=0, columnspan=2, sticky="w", pady=(14, 0))
         ttk.Button(actions, text="Сохранить", command=self._save_settings).pack(side="left")
         ttk.Button(actions, text="Сохранить и проверить", command=self._save_and_test_settings).pack(
             side="left", padx=6
@@ -692,8 +707,9 @@ class AutomationApp(tk.Tk):
         ttk.Label(
             note,
             text=(
-                "Используйте отдельный пароль для внешнего приложения с полным доступом к Почте. "
-                "Основной пароль аккаунта вводить не нужно. Секрет хранится в Windows Credential Manager, а не в SQLite."
+                "Mail.ru: нужен отдельный пароль для внешнего приложения с полным доступом к Почте, "
+                "основной пароль аккаунта не подойдёт. Timeweb: логин — полный адрес ящика, пароль — "
+                "обычный пароль от ящика. Пароль хранится в Windows Credential Manager, а не в SQLite."
             ),
             wraplength=950,
             justify="left",
@@ -837,6 +853,8 @@ class AutomationApp(tk.Tk):
 
     def refresh_settings(self) -> None:
         preferences = self.service.get_mail_preferences()
+        self.settings_provider_var.set(MAIL_PROVIDERS[preferences["mail_provider"]].title)
+        self._update_password_hint()
         self.settings_email_var.set(preferences["email_address"])
         self.settings_interval_var.set(preferences["check_interval_minutes"] or "10")
         self.password_state_var.set(
@@ -1417,6 +1435,19 @@ class AutomationApp(tk.Tk):
         if tags:
             self._open_path(Path(tags[0]))
 
+    def _selected_provider_key(self) -> str:
+        title = self.settings_provider_var.get()
+        return next((p.key for p in MAIL_PROVIDERS.values() if p.title == title), "mailru")
+
+    def _update_password_hint(self) -> None:
+        if self._selected_provider_key() == "mailru":
+            hint = "Пароль для внешних приложений Mail.ru (Настройки → Безопасность). "
+        else:
+            hint = "Обычный пароль от почтового ящика. "
+        self.settings_password_hint_var.set(
+            hint + "Оставьте поле пустым, чтобы не менять уже сохранённый пароль."
+        )
+
     def _save_settings(self, silent: bool = False) -> bool:
         try:
             interval = int(self.settings_interval_var.get())
@@ -1424,6 +1455,7 @@ class AutomationApp(tk.Tk):
                 self.settings_email_var.get(),
                 interval,
                 self.settings_password_var.get(),
+                self._selected_provider_key(),
             )
         except Exception as exc:
             messagebox.showerror("Настройки", str(exc), parent=self)
@@ -1447,7 +1479,7 @@ class AutomationApp(tk.Tk):
 
     def _delete_password(self) -> None:
         if not messagebox.askyesno(
-            "Удаление пароля", "Удалить сохранённый пароль приложения?", parent=self
+            "Удаление пароля", "Удалить сохранённый пароль почты?", parent=self
         ):
             return
         try:

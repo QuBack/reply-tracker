@@ -64,7 +64,7 @@ class WindowsCredentialStore:
         credential = _CredentialW()
         credential.Type = self.CRED_TYPE_GENERIC
         credential.TargetName = self.target
-        credential.Comment = "Пароль внешнего приложения Mail.ru для системы автоматизации"
+        credential.Comment = "Пароль почтового ящика для системы автоматизации"
         credential.CredentialBlobSize = len(blob)
         credential.CredentialBlob = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte))
         credential.Persist = self.CRED_PERSIST_LOCAL_MACHINE
