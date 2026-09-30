@@ -510,6 +510,87 @@ class Database:
                 (status, utc_now(), candidate_id),
             )
 
+    def delete_candidates(self, candidate_ids: Iterable[int]) -> int:
+        ids = [int(value) for value in candidate_ids]
+        with self.connect() as connection:
+            deleted = connection.executemany(
+                "DELETE FROM supplier_candidates WHERE id = ?", ((value,) for value in ids)
+            ).rowcount
+        self.log("info", "supplier_candidates_deleted", None, {"ids": ids})
+        return max(deleted, 0)
+
+    def add_candidates_category(self, candidate_ids: Iterable[int], category: str) -> int:
+        category = category.strip()[:100]
+        if not category:
+            raise ValueError("Введите категорию")
+        changed = 0
+        with self.connect() as connection:
+            for candidate_id in candidate_ids:
+                row = connection.execute(
+                    "SELECT status, categories_json FROM supplier_candidates WHERE id = ?",
+                    (int(candidate_id),),
+                ).fetchone()
+                if row is None or row["status"] == "approved":
+                    continue
+                categories = json.loads(row["categories_json"])
+                if any(value.casefold() == category.casefold() for value in categories):
+                    continue
+                connection.execute(
+                    "UPDATE supplier_candidates SET categories_json = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(categories + [category], ensure_ascii=False), utc_now(),
+                     int(candidate_id)),
+                )
+                changed += 1
+        return changed
+
+    def set_suppliers_excluded(self, supplier_ids: Iterable[int], excluded: bool,
+                               reason: str = "") -> int:
+        ids = [int(value) for value in supplier_ids]
+        reason = reason.strip() if excluded else ""
+        now = utc_now()
+        with self.connect() as connection:
+            changed = connection.executemany(
+                "UPDATE suppliers SET excluded = ?, excluded_reason = ?, updated_at = ? WHERE id = ?",
+                ((int(excluded), reason, now, value) for value in ids),
+            ).rowcount
+        self.log("info", "suppliers_exclusion_changed", None, {
+            "ids": ids, "excluded": excluded,
+        })
+        return max(changed, 0)
+
+    def change_suppliers_category(self, supplier_ids: Iterable[int], category: str, *,
+                                  remove: bool = False) -> int:
+        category = category.strip()[:100]
+        if not category:
+            raise ValueError("Введите категорию")
+        # COLLATE NOCASE в SQLite не сворачивает кириллицу, поэтому сравниваем через casefold.
+        key = category.casefold()
+        changed = 0
+        with self.connect() as connection:
+            # Используем уже принятое в справочнике написание, чтобы не плодить дубли в фильтре.
+            category = next((row["category"] for row in connection.execute(
+                "SELECT DISTINCT category FROM supplier_categories"
+            ) if row["category"].casefold() == key), category)
+            for supplier_id in supplier_ids:
+                existing = [row["category"] for row in connection.execute(
+                    "SELECT category FROM supplier_categories WHERE supplier_id = ?",
+                    (int(supplier_id),),
+                )]
+                matches = [value for value in existing if value.casefold() == key]
+                if remove and matches:
+                    connection.executemany(
+                        "DELETE FROM supplier_categories WHERE supplier_id = ? AND category = ?",
+                        ((int(supplier_id), value) for value in matches),
+                    )
+                    changed += 1
+                elif not remove and not matches:
+                    connection.execute(
+                        "INSERT INTO supplier_categories(supplier_id, category) VALUES(?, ?)",
+                        (int(supplier_id), category),
+                    )
+                    changed += 1
+        return changed
+
     def approve_candidate(self, candidate_id: int) -> int:
         with self.connect() as connection:
             candidate = connection.execute(

@@ -10,7 +10,7 @@ import tkinter as tk
 import webbrowser
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from typing import Callable
 
 from .database import Database
@@ -38,6 +38,15 @@ RECIPIENT_STATUS_LABELS = {
     "send_unknown": "Исход отправки неизвестен",
 }
 
+CANDIDATE_STATUS_LABELS = {
+    "new": "На проверке",
+    "approved": "Добавлен",
+    "rejected": "Отклонён",
+}
+
+ALL_CATEGORIES = "Все категории"
+ALL_STATUSES = "Все статусы"
+
 MATCH_METHOD_LABELS = {
     "reply_headers": "По цепочке письма",
     "subject_code": "По коду в теме",
@@ -58,6 +67,12 @@ def incoming_result_label(row: sqlite3.Row) -> str:
     if row["attachment_count"]:
         return "Нет PDF/Excel"
     return "Ответ без файлов"
+
+
+def text_matches(query: str, *fields: str) -> bool:
+    words = query.casefold().split()
+    haystack = " ".join(str(field or "") for field in fields).casefold()
+    return all(word in haystack for word in words)
 
 
 def display_datetime(value: str | None) -> str:
@@ -89,6 +104,7 @@ class AutomationApp(tk.Tk):
         self._selected_candidate_id: int | None = None
         self._campaign_supplier_ids: list[int] = []
         self._supplier_rows: dict[int, sqlite3.Row] = {}
+        self._candidate_rows: dict[int, sqlite3.Row] = {}
         self._campaign_attachment_paths: list[str] = []
         self._supplier_search_cancel = threading.Event()
         self._search_active = False
@@ -173,11 +189,18 @@ class AutomationApp(tk.Tk):
         left.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
         left.rowconfigure(1, weight=1)
         left.columnconfigure(0, weight=1)
-        self.supplier_filter_var = tk.StringVar(value="Все категории")
+        filters = ttk.Frame(left)
+        filters.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        filters.columnconfigure(1, weight=1)
+        ttk.Label(filters, text="Поиск").grid(row=0, column=0, padx=(0, 6))
+        self.supplier_search_var = tk.StringVar()
+        ttk.Entry(filters, textvariable=self.supplier_search_var).grid(row=0, column=1, sticky="ew")
+        self.supplier_search_var.trace_add("write", lambda *_args: self.refresh_suppliers())
+        self.supplier_filter_var = tk.StringVar(value=ALL_CATEGORIES)
         self.supplier_filter_box = ttk.Combobox(
-            left, textvariable=self.supplier_filter_var, state="readonly"
+            filters, textvariable=self.supplier_filter_var, state="readonly", width=24
         )
-        self.supplier_filter_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self.supplier_filter_box.grid(row=0, column=2, padx=(8, 0))
         self.supplier_filter_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_suppliers())
         self.suppliers_tree = self._make_tree(
             left,
@@ -188,10 +211,33 @@ class AutomationApp(tk.Tk):
                 ("excluded", "Рассылки", 110),
                 ("notes", "Заметки", 260),
             ],
+            selectmode="extended",
         )
         self.suppliers_tree.tag_configure("excluded", foreground="#9A3A3A")
         self.suppliers_tree.grid(row=1, column=0, sticky="nsew")
         self.suppliers_tree.bind("<<TreeviewSelect>>", self._on_supplier_selected)
+        self._bind_select_all(self.suppliers_tree)
+        bulk = ttk.Frame(left)
+        bulk.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(bulk, text="Выделить все",
+                   command=lambda: self._select_all(self.suppliers_tree)).pack(side="left")
+        supplier_actions = ttk.Menubutton(bulk, text="Действия с выбранными")
+        supplier_actions.pack(side="left", padx=6)
+        supplier_menu = tk.Menu(supplier_actions, tearoff=False)
+        supplier_menu.add_command(label="Исключить из рассылок…",
+                                  command=lambda: self._set_selected_suppliers_excluded(True))
+        supplier_menu.add_command(label="Вернуть в рассылки",
+                                  command=lambda: self._set_selected_suppliers_excluded(False))
+        supplier_menu.add_separator()
+        supplier_menu.add_command(label="Добавить категорию…",
+                                  command=lambda: self._change_selected_suppliers_category(False))
+        supplier_menu.add_command(label="Убрать категорию…",
+                                  command=lambda: self._change_selected_suppliers_category(True))
+        supplier_menu.add_separator()
+        supplier_menu.add_command(label="Удалить", command=self._delete_supplier)
+        supplier_actions["menu"] = supplier_menu
+        self.suppliers_count_var = tk.StringVar()
+        ttk.Label(bulk, textvariable=self.suppliers_count_var, style="Muted.TLabel").pack(side="right")
 
         form = ttk.LabelFrame(self.suppliers_tab, text="Карточка поставщика", padding=14)
         form.grid(row=1, column=1, sticky="nsew")
@@ -258,27 +304,86 @@ class AutomationApp(tk.Tk):
             request, text="Остановить", command=self._cancel_supplier_search, state="disabled"
         )
         self.search_cancel_button.grid(row=2, column=3, padx=4)
-        ttk.Button(request, text="Выгрузить Excel", command=self._export_search_candidates).grid(
-            row=2, column=4, padx=4
-        )
 
         body = ttk.PanedWindow(self.search_tab, orient="horizontal")
         body.grid(row=2, column=0, sticky="nsew")
         left = ttk.Frame(body)
         left.columnconfigure(0, weight=1)
-        left.rowconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
+        filters = ttk.Frame(left)
+        filters.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        filters.columnconfigure(1, weight=1)
+        ttk.Label(filters, text="Фильтр").grid(row=0, column=0, padx=(0, 6))
+        self.candidate_filter_text_var = tk.StringVar()
+        ttk.Entry(filters, textvariable=self.candidate_filter_text_var).grid(
+            row=0, column=1, sticky="ew"
+        )
+        self.candidate_filter_status_var = tk.StringVar(value=ALL_STATUSES)
+        ttk.Combobox(
+            filters, textvariable=self.candidate_filter_status_var, state="readonly", width=14,
+            values=[ALL_STATUSES, *CANDIDATE_STATUS_LABELS.values()],
+        ).grid(row=0, column=2, padx=(6, 0))
+        self.candidate_filter_category_var = tk.StringVar(value=ALL_CATEGORIES)
+        self.candidate_filter_category_box = ttk.Combobox(
+            filters, textvariable=self.candidate_filter_category_var, state="readonly", width=20
+        )
+        self.candidate_filter_category_box.grid(row=0, column=3, padx=(6, 0))
+        self.candidate_filter_email_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(filters, text="С email", variable=self.candidate_filter_email_var,
+                        command=self._fill_candidates_tree).grid(row=0, column=4, padx=(6, 0))
+        ttk.Button(filters, text="Сбросить", command=self._reset_candidate_filters).grid(
+            row=0, column=5, padx=(6, 0)
+        )
+        for variable in (self.candidate_filter_text_var, self.candidate_filter_status_var,
+                         self.candidate_filter_category_var):
+            variable.trace_add("write", lambda *_args: self._fill_candidates_tree())
+
         self.candidates_tree = self._make_tree(left, [
             ("name", "Компания", 240),
             ("categories", "Категории", 220),
             ("region", "Регион", 130),
             ("email", "Email", 190),
             ("status", "Статус", 120),
-        ])
-        self.candidates_tree.grid(row=0, column=0, sticky="nsew")
+        ], selectmode="extended")
+        self.candidates_tree.grid(row=1, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(left, orient="vertical", command=self.candidates_tree.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        scrollbar.grid(row=1, column=1, sticky="ns")
         self.candidates_tree.configure(yscrollcommand=scrollbar.set)
         self.candidates_tree.bind("<<TreeviewSelect>>", self._on_candidate_selected)
+        self._bind_select_all(self.candidates_tree)
+
+        bulk = ttk.Frame(left)
+        bulk.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(bulk, text="Выделить все",
+                   command=lambda: self._select_all(self.candidates_tree)).pack(side="left")
+        candidate_actions = ttk.Menubutton(bulk, text="Действия с выбранными")
+        candidate_actions.pack(side="left", padx=6)
+        candidate_menu = tk.Menu(candidate_actions, tearoff=False)
+        candidate_menu.add_command(label="Добавить в справочник",
+                                   command=self._approve_selected_candidates)
+        candidate_menu.add_command(label="Отклонить",
+                                   command=lambda: self._set_selected_candidates_status("rejected"))
+        candidate_menu.add_command(label="Вернуть на проверку",
+                                   command=lambda: self._set_selected_candidates_status("new"))
+        candidate_menu.add_separator()
+        candidate_menu.add_command(label="Добавить категорию…",
+                                   command=self._add_category_to_selected_candidates)
+        candidate_menu.add_separator()
+        candidate_menu.add_command(label="Удалить из списка",
+                                   command=self._delete_selected_candidates)
+        candidate_actions["menu"] = candidate_menu
+        ttk.Button(bulk, text="Выгрузить все",
+                   command=lambda: self._export_search_candidates(only_selected=False)).pack(
+            side="right"
+        )
+        ttk.Button(bulk, text="Выгрузить выбранные",
+                   command=lambda: self._export_search_candidates(only_selected=True)).pack(
+            side="right", padx=6
+        )
+        self.candidates_count_var = tk.StringVar()
+        ttk.Label(left, textvariable=self.candidates_count_var, style="Muted.TLabel").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(4, 0)
+        )
         body.add(left, weight=3)
 
         details = ttk.LabelFrame(body, text="Проверка кандидата", padding=9)
@@ -716,9 +821,10 @@ class AutomationApp(tk.Tk):
         ).pack(anchor="w")
 
     @staticmethod
-    def _make_tree(parent: tk.Misc, columns: list[tuple[str, str, int]]) -> ttk.Treeview:
+    def _make_tree(parent: tk.Misc, columns: list[tuple[str, str, int]],
+                   selectmode: str = "browse") -> ttk.Treeview:
         keys = [item[0] for item in columns]
-        tree = ttk.Treeview(parent, columns=keys, show="headings", selectmode="browse")
+        tree = ttk.Treeview(parent, columns=keys, show="headings", selectmode=selectmode)
         for key, title, width in columns:
             tree.heading(key, text=title)
             tree.column(key, width=width, minwidth=55, stretch=True)
@@ -743,14 +849,14 @@ class AutomationApp(tk.Tk):
 
     def refresh_suppliers(self) -> None:
         selected = self.suppliers_tree.selection()
-        selected_id = selected[0] if selected else None
         self.suppliers_tree.delete(*self.suppliers_tree.get_children())
         suppliers = self.db.list_suppliers()
-        categories = ["Все категории"] + self.db.list_categories()
+        categories = [ALL_CATEGORIES] + self.db.list_categories()
         self.supplier_filter_box.configure(values=categories)
         if self.supplier_filter_var.get() not in categories:
-            self.supplier_filter_var.set("Все категории")
+            self.supplier_filter_var.set(ALL_CATEGORIES)
         selected_category = self.supplier_filter_var.get()
+        search = self.supplier_search_var.get()
         self._campaign_supplier_ids = []
         compose_list = getattr(self, "compose_suppliers_list", None)
         if compose_list is not None and compose_list.winfo_exists():
@@ -761,7 +867,10 @@ class AutomationApp(tk.Tk):
         for row in suppliers:
             iid = str(row["id"])
             row_categories = [value.strip() for value in row["categories"].split(",") if value.strip()]
-            if selected_category == "Все категории" or selected_category in row_categories:
+            category_ok = (selected_category == ALL_CATEGORIES or
+                           selected_category.casefold() in (value.casefold() for value in row_categories))
+            if category_ok and text_matches(search, row["name"], row["email"],
+                                            row["categories"], row["notes"]):
                 self.suppliers_tree.insert(
                     "", "end", iid=iid,
                     values=(row["name"], row["email"], row["categories"],
@@ -773,8 +882,17 @@ class AutomationApp(tk.Tk):
             self._campaign_supplier_ids.append(int(row["id"]))
             if compose_list is not None:
                 compose_list.insert("end", f"{row['name']}  <{row['email']}>")
-        if selected_id and self.suppliers_tree.exists(selected_id):
-            self.suppliers_tree.selection_set(selected_id)
+        visible = [iid for iid in selected if self.suppliers_tree.exists(iid)]
+        if visible:
+            self.suppliers_tree.selection_set(visible)
+        self._update_suppliers_count()
+
+    def _update_suppliers_count(self) -> None:
+        shown = len(self.suppliers_tree.get_children())
+        selected = len(self.suppliers_tree.selection())
+        self.suppliers_count_var.set(
+            f"Показано {shown} из {len(self._supplier_rows)}, выбрано {selected}"
+        )
 
     def refresh_campaigns(self) -> None:
         selection = self.campaigns_tree.selection()
@@ -862,8 +980,13 @@ class AutomationApp(tk.Tk):
         )
 
     def _on_supplier_selected(self, _event: tk.Event | None = None) -> None:
+        self._update_suppliers_count()
         selection = self.suppliers_tree.selection()
         if not selection:
+            return
+        if len(selection) > 1:
+            # В карточке редактируется только один поставщик; для группы — меню действий.
+            self._clear_supplier_fields()
             return
         self._selected_supplier_id = int(selection[0])
         row = self._supplier_rows.get(self._selected_supplier_id)
@@ -879,8 +1002,11 @@ class AutomationApp(tk.Tk):
         self._update_exclusion_reason_state()
 
     def _clear_supplier_form(self) -> None:
-        self._selected_supplier_id = None
         self.suppliers_tree.selection_remove(*self.suppliers_tree.selection())
+        self._clear_supplier_fields()
+
+    def _clear_supplier_fields(self) -> None:
+        self._selected_supplier_id = None
         self.supplier_name_var.set("")
         self.supplier_email_var.set("")
         self.supplier_categories_var.set("")
@@ -919,46 +1045,137 @@ class AutomationApp(tk.Tk):
         self.status_var.set("Поставщик сохранён")
 
     def _delete_supplier(self) -> None:
-        if self._selected_supplier_id is None:
+        supplier_ids = self._selected_ids(self.suppliers_tree)
+        if not supplier_ids:
             return
-        if not messagebox.askyesno(
-            "Удаление", "Удалить выбранного поставщика?", parent=self
-        ):
+        question = ("Удалить выбранного поставщика?" if len(supplier_ids) == 1 else
+                    f"Удалить выбранных поставщиков: {len(supplier_ids)}?")
+        if not messagebox.askyesno("Удаление", question, parent=self):
             return
-        try:
-            self.db.delete_supplier(self._selected_supplier_id)
-        except sqlite3.IntegrityError:
-            messagebox.showerror(
+        kept = 0
+        for supplier_id in supplier_ids:
+            try:
+                self.db.delete_supplier(supplier_id)
+            except sqlite3.IntegrityError:
+                kept += 1
+        if kept:
+            messagebox.showwarning(
                 "Удаление",
-                "Поставщик уже участвует в рассылке и должен остаться в истории.",
+                f"Не удалено: {kept}. Эти поставщики уже участвуют в рассылках "
+                "и должны остаться в истории — их можно исключить из рассылок.",
                 parent=self,
             )
-            return
         self._clear_supplier_form()
         self.refresh_suppliers()
         self.refresh_dashboard()
+        self.status_var.set(f"Удалено поставщиков: {len(supplier_ids) - kept}")
+
+    def _set_selected_suppliers_excluded(self, excluded: bool) -> None:
+        supplier_ids = self._selected_ids(self.suppliers_tree)
+        if not supplier_ids:
+            self.status_var.set("Выберите поставщиков в таблице")
+            return
+        reason = ""
+        if excluded:
+            answer = simpledialog.askstring(
+                "Исключение", f"Причина исключения ({len(supplier_ids)} пост.):", parent=self
+            )
+            if answer is None:
+                return
+            reason = answer
+        changed = self.db.set_suppliers_excluded(supplier_ids, excluded, reason)
+        self.refresh_suppliers()
+        self._on_supplier_selected()
+        self.status_var.set(
+            f"{'Исключено из рассылок' if excluded else 'Возвращено в рассылки'}: {changed}"
+        )
+
+    def _change_selected_suppliers_category(self, remove: bool) -> None:
+        supplier_ids = self._selected_ids(self.suppliers_tree)
+        if not supplier_ids:
+            self.status_var.set("Выберите поставщиков в таблице")
+            return
+        category = simpledialog.askstring(
+            "Категория",
+            f"{'Убрать' if remove else 'Добавить'} категорию ({len(supplier_ids)} пост.):",
+            parent=self,
+        )
+        if not category or not category.strip():
+            return
+        changed = self.db.change_suppliers_category(supplier_ids, category, remove=remove)
+        self.refresh_suppliers()
+        self._on_supplier_selected()
+        self.status_var.set(
+            f"Категория «{category.strip()}» {'убрана' if remove else 'добавлена'}: {changed} пост."
+        )
 
     def refresh_search_candidates(self) -> None:
+        rows = self.db.list_candidates()
+        self._candidate_rows = {int(row["id"]): row for row in rows}
+        categories = sorted(
+            {value for row in rows for value in json.loads(row["categories_json"])},
+            key=str.casefold,
+        )
+        values = [ALL_CATEGORIES, *categories]
+        self.candidate_filter_category_box.configure(values=values)
+        if self.candidate_filter_category_var.get() not in values:
+            self.candidate_filter_category_var.set(ALL_CATEGORIES)
+        self._fill_candidates_tree()
+
+    def _fill_candidates_tree(self) -> None:
         selected = self.candidates_tree.selection()
-        selected_id = selected[0] if selected else None
         self.candidates_tree.delete(*self.candidates_tree.get_children())
-        for row in self.db.list_candidates():
+        search = self.candidate_filter_text_var.get()
+        status_label = self.candidate_filter_status_var.get()
+        category = self.candidate_filter_category_var.get().casefold()
+        only_with_email = self.candidate_filter_email_var.get()
+        for candidate_id, row in self._candidate_rows.items():
+            categories = json.loads(row["categories_json"])
+            status = CANDIDATE_STATUS_LABELS.get(row["status"], row["status"])
+            if status_label != ALL_STATUSES and status != status_label:
+                continue
+            if (category != ALL_CATEGORIES.casefold() and
+                    category not in (value.casefold() for value in categories)):
+                continue
+            if only_with_email and not row["email"]:
+                continue
+            if not text_matches(search, row["name"], row["email"], row["website"],
+                                row["region"], row["evidence"], row["search_query"],
+                                " ".join(categories)):
+                continue
             self.candidates_tree.insert(
-                "", "end", iid=str(row["id"]), values=(
-                    row["name"], ", ".join(json.loads(row["categories_json"])),
-                    row["region"], row["email"],
-                    {"new": "На проверке", "approved": "Добавлен",
-                     "rejected": "Отклонён"}.get(row["status"], row["status"]),
+                "", "end", iid=str(candidate_id), values=(
+                    row["name"], ", ".join(categories), row["region"], row["email"], status,
                 )
             )
-        if selected_id and self.candidates_tree.exists(selected_id):
-            self.candidates_tree.selection_set(selected_id)
-            self._on_candidate_selected()
+        visible = [iid for iid in selected if self.candidates_tree.exists(iid)]
+        if visible:
+            self.candidates_tree.selection_set(visible)
+        self._on_candidate_selected()
+
+    def _reset_candidate_filters(self) -> None:
+        self.candidate_filter_text_var.set("")
+        self.candidate_filter_status_var.set(ALL_STATUSES)
+        self.candidate_filter_category_var.set(ALL_CATEGORIES)
+        self.candidate_filter_email_var.set(False)
+        self._fill_candidates_tree()
+
+    def _update_candidates_count(self) -> None:
+        shown = len(self.candidates_tree.get_children())
+        selected = len(self.candidates_tree.selection())
+        self.candidates_count_var.set(
+            f"Показано {shown} из {len(self._candidate_rows)}, выбрано {selected}"
+        )
 
     def _on_candidate_selected(self, _event: tk.Event | None = None) -> None:
-        candidate_id = self._selected_tree_id(self.candidates_tree)
-        if candidate_id is None:
+        self._update_candidates_count()
+        selection = self.candidates_tree.selection()
+        if len(selection) != 1:
+            # Карточка редактирует одну компанию; для группы — меню «Действия с выбранными».
+            self._selected_candidate_id = None
+            self._clear_candidate_form()
             return
+        candidate_id = int(selection[0])
         row = self.db.get_candidate(candidate_id)
         if row is None:
             return
@@ -979,6 +1196,101 @@ class AutomationApp(tk.Tk):
         for button in (self.candidate_save_button, self.candidate_approve_button,
                        self.candidate_reject_button):
             button.configure(state=state)
+
+    def _clear_candidate_form(self) -> None:
+        for variable in (self.candidate_name_var, self.candidate_site_var,
+                         self.candidate_email_var, self.candidate_region_var,
+                         self.candidate_categories_var, self.candidate_contact_url_var):
+            variable.set("")
+        self.candidate_sources_text.delete("1.0", "end")
+        self.candidate_evidence_text.delete("1.0", "end")
+        for button in (self.candidate_save_button, self.candidate_approve_button,
+                       self.candidate_reject_button):
+            button.configure(state="disabled")
+
+    def _approve_selected_candidates(self) -> None:
+        candidate_ids = self._selected_ids(self.candidates_tree)
+        if not candidate_ids:
+            self.search_status_var.set("Выберите компании в таблице")
+            return
+        if len(candidate_ids) > 1 and not messagebox.askyesno(
+            "Справочник", f"Добавить в справочник выбранные компании: {len(candidate_ids)}?",
+            parent=self,
+        ):
+            return
+        added = already = 0
+        problems: list[str] = []
+        for candidate_id in candidate_ids:
+            row = self._candidate_rows.get(candidate_id)
+            if row is not None and row["status"] == "approved":
+                already += 1
+                continue
+            try:
+                self.db.approve_candidate(candidate_id)
+                added += 1
+            except ValueError as exc:
+                problems.append(f"{row['name'] if row else candidate_id}: {exc}")
+        self.refresh_search_candidates()
+        self.refresh_suppliers()
+        message = f"Добавлено в справочник: {added}"
+        if already:
+            message += f", уже были в справочнике: {already}"
+        if problems:
+            message += f", пропущено: {len(problems)}"
+            messagebox.showwarning("Справочник", "\n".join(problems[:15]), parent=self)
+        self.search_status_var.set(message)
+
+    def _set_selected_candidates_status(self, status: str) -> None:
+        candidate_ids = self._selected_ids(self.candidates_tree)
+        if not candidate_ids:
+            self.search_status_var.set("Выберите компании в таблице")
+            return
+        changed = skipped = 0
+        for candidate_id in candidate_ids:
+            try:
+                self.db.set_candidate_status(candidate_id, status)
+                changed += 1
+            except ValueError:
+                skipped += 1
+        self.refresh_search_candidates()
+        label = "Отклонено" if status == "rejected" else "Возвращено на проверку"
+        message = f"{label}: {changed}"
+        if skipped:
+            message += f", пропущено (уже в справочнике): {skipped}"
+        self.search_status_var.set(message)
+
+    def _add_category_to_selected_candidates(self) -> None:
+        candidate_ids = self._selected_ids(self.candidates_tree)
+        if not candidate_ids:
+            self.search_status_var.set("Выберите компании в таблице")
+            return
+        category = simpledialog.askstring(
+            "Категория", f"Добавить категорию ({len(candidate_ids)} комп.):", parent=self
+        )
+        if not category or not category.strip():
+            return
+        changed = self.db.add_candidates_category(candidate_ids, category)
+        self.refresh_search_candidates()
+        self.search_status_var.set(
+            f"Категория «{category.strip()}» добавлена: {changed} комп. "
+            "(у добавленных в справочник категории меняются в справочнике)"
+        )
+
+    def _delete_selected_candidates(self) -> None:
+        candidate_ids = self._selected_ids(self.candidates_tree)
+        if not candidate_ids:
+            self.search_status_var.set("Выберите компании в таблице")
+            return
+        if not messagebox.askyesno(
+            "Удаление",
+            f"Удалить из списка найденных: {len(candidate_ids)}?\n"
+            "Поставщики в справочнике не затрагиваются.",
+            parent=self,
+        ):
+            return
+        deleted = self.db.delete_candidates(candidate_ids)
+        self.refresh_search_candidates()
+        self.search_status_var.set(f"Удалено из списка найденных: {deleted}")
 
     def _save_candidate(self) -> bool:
         if self._selected_candidate_id is None:
@@ -1096,11 +1408,19 @@ class AutomationApp(tk.Tk):
         self.search_cancel_button.configure(state="disabled")
         self.search_status_var.set("Останавливаем поиск...")
 
-    def _export_search_candidates(self) -> None:
-        rows = self.db.list_candidates()
-        if not rows:
-            messagebox.showinfo("Excel", "Пока нет найденных поставщиков.", parent=self)
-            return
+    def _export_search_candidates(self, only_selected: bool) -> None:
+        if only_selected:
+            ids = self._selected_ids(self.candidates_tree)
+            if not ids:
+                messagebox.showinfo("Excel", "Выберите компании в таблице.", parent=self)
+                return
+        else:
+            # «Все» — всё, что показано в таблице с учётом фильтра.
+            ids = [int(iid) for iid in self.candidates_tree.get_children()]
+            if not ids:
+                messagebox.showinfo("Excel", "В таблице нет компаний для выгрузки.", parent=self)
+                return
+        rows = [self._candidate_rows[value] for value in ids if value in self._candidate_rows]
         filename = filedialog.asksaveasfilename(
             title="Сохранить найденных поставщиков", defaultextension=".xlsx",
             filetypes=[("Excel XLSX", "*.xlsx")], parent=self,
@@ -1112,7 +1432,7 @@ class AutomationApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Excel", str(exc), parent=self)
             return
-        self.search_status_var.set(f"Таблица сохранена: {filename}")
+        self.search_status_var.set(f"Выгружено компаний: {len(rows)} — {filename}")
 
     def _add_campaign_files(self) -> None:
         selected = filedialog.askopenfilenames(
@@ -1543,6 +1863,22 @@ class AutomationApp(tk.Tk):
         path = path.resolve()
         if path.exists():
             os.startfile(str(path))
+
+    @staticmethod
+    def _selected_ids(tree: ttk.Treeview) -> list[int]:
+        # В порядке строк таблицы, а не в порядке щелчков.
+        selected = set(tree.selection())
+        return [int(iid) for iid in tree.get_children() if iid in selected]
+
+    @staticmethod
+    def _select_all(tree: ttk.Treeview) -> None:
+        if tree.get_children():
+            tree.selection_set(tree.get_children())
+
+    def _bind_select_all(self, tree: ttk.Treeview) -> None:
+        for sequence in ("<Control-a>", "<Control-A>", "<Control-Cyrillic_ef>",
+                         "<Control-Cyrillic_EF>"):
+            tree.bind(sequence, lambda _event: (self._select_all(tree), "break")[1])
 
     @staticmethod
     def _selected_tree_id(tree: ttk.Treeview) -> int | None:

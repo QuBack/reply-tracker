@@ -68,6 +68,40 @@ class SupplierSearchTests(unittest.TestCase):
                 contact_source_url=first.contact_source_url,
             )
 
+    def test_bulk_category_and_delete_skip_approved_candidates(self) -> None:
+        self.db.import_candidates("гидроцилиндры", "Россия", [
+            sample_candidate(),
+            sample_candidate(name="Второй", website="https://second.example.ru",
+                             email="info@second.example.ru",
+                             contact_source_url="https://second.example.ru/contacts"),
+        ])
+        rows = {row["name"]: int(row["id"]) for row in self.db.list_candidates()}
+        self.db.approve_candidate(rows["Завод Гидропривод"])
+        changed = self.db.add_candidates_category(rows.values(), " гидроцилиндры ")
+        self.assertEqual(changed, 0)  # у второго такая категория уже есть (без учёта регистра)
+        self.assertEqual(self.db.add_candidates_category(rows.values(), "Насосы"), 1)
+        second = self.db.get_candidate(rows["Второй"])
+        self.assertEqual(json.loads(second["categories_json"]), ["Гидроцилиндры", "Насосы"])
+        self.assertEqual(self.db.delete_candidates(rows.values()), 2)
+        self.assertEqual(self.db.list_candidates(), [])
+        self.assertEqual(len(self.db.list_suppliers()), 1)
+
+    def test_bulk_supplier_exclusion_and_categories(self) -> None:
+        first = self.db.save_supplier("Первый", "one@example.ru", categories=["Насосы"])
+        second = self.db.save_supplier("Второй", "two@example.ru")
+        self.assertEqual(self.db.set_suppliers_excluded([first, second], True, "дорого"), 2)
+        self.assertTrue(all(row["excluded"] and row["excluded_reason"] == "дорого"
+                            for row in self.db.list_suppliers()))
+        self.db.set_suppliers_excluded([first], False, "игнорируется")
+        by_id = {int(row["id"]): row for row in self.db.list_suppliers()}
+        self.assertEqual((by_id[first]["excluded"], by_id[first]["excluded_reason"]), (0, ""))
+        self.assertEqual(self.db.change_suppliers_category([first, second], "насосы"), 1)
+        self.assertEqual(self.db.list_categories(), ["Насосы"])
+        self.assertEqual(
+            self.db.change_suppliers_category([first, second], "НАСОСЫ", remove=True), 2
+        )
+        self.assertEqual(self.db.list_categories(), [])
+
     def test_existing_supplier_is_linked_without_overwriting_its_name(self) -> None:
         existing_id = self.db.save_supplier(
             "Проверенное название", "sales@gidro.example.ru", categories=["Металлоконструкции"]
