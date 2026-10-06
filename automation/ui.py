@@ -49,6 +49,14 @@ ALL_CATEGORIES = "Все категории"
 ALL_STATUSES = "Все статусы"
 ANY_CONTACTS = "Любые контакты"
 
+# Коды клавиш Windows (VK_*) для сочетаний с Ctrl в любой раскладке.
+CONTROL_KEYCODE_EVENTS = {
+    86: "<<Paste>>",      # V
+    67: "<<Copy>>",       # C
+    88: "<<Cut>>",        # X
+    65: "<<SelectAll>>",  # A
+}
+
 # Фильтр «Контакты» на вкладке поиска: (есть email, есть телефон) -> показывать ли строку.
 CONTACT_FILTERS = {
     ANY_CONTACTS: lambda has_email, has_phone: True,
@@ -138,6 +146,7 @@ class AutomationApp(tk.Tk):
 
         self._configure_style()
         self._build_layout()
+        self.bind_all("<Control-KeyPress>", self._on_control_key, add="+")
         self.refresh_all()
         self.after(200, self._poll_tasks)
         self.after(2500, self._startup_check)
@@ -1968,6 +1977,20 @@ class AutomationApp(tk.Tk):
     def _select_all(tree: ttk.Treeview) -> None:
         if tree.get_children():
             tree.selection_set(tree.get_children())
+
+    @staticmethod
+    def _on_control_key(event: tk.Event) -> str | None:
+        # Tk связывает Ctrl+V/C/X/A с латинской буквой, поэтому в русской раскладке
+        # (Ctrl+«м») вставка не срабатывает. Распознаём клавишу по коду Windows,
+        # который не зависит от раскладки.
+        if len(event.keysym) == 1 and event.keysym.isascii():
+            return None  # латинская раскладка — работают стандартные привязки Tk
+        virtual = CONTROL_KEYCODE_EVENTS.get(event.keycode)
+        widget = event.widget
+        if virtual is None or not isinstance(widget, (tk.Entry, ttk.Entry, tk.Text)):
+            return None
+        widget.event_generate(virtual)
+        return "break"
 
     def _bind_select_all(self, tree: ttk.Treeview) -> None:
         for sequence in ("<Control-a>", "<Control-A>", "<Control-Cyrillic_ef>",
