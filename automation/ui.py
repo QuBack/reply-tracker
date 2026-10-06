@@ -16,8 +16,9 @@ from typing import Callable
 from .database import Database
 from .mail_gateway import MAIL_PROVIDERS
 from .service import AppService, OperationResult
-from .supplier_search import (SearchCancelled, clean_categories, export_candidates_xlsx,
-                              normalize_email, normalize_web_url, run_codex_search)
+from .supplier_search import (SearchCancelled, clean_categories, clean_phones,
+                              export_candidates_xlsx, normalize_email, normalize_web_url,
+                              run_codex_search)
 
 
 CAMPAIGN_STATUS_LABELS = {
@@ -46,6 +47,18 @@ CANDIDATE_STATUS_LABELS = {
 
 ALL_CATEGORIES = "Все категории"
 ALL_STATUSES = "Все статусы"
+ANY_CONTACTS = "Любые контакты"
+
+# Фильтр «Контакты» на вкладке поиска: (есть email, есть телефон) -> показывать ли строку.
+CONTACT_FILTERS = {
+    ANY_CONTACTS: lambda has_email, has_phone: True,
+    "С email": lambda has_email, has_phone: has_email,
+    "С телефоном": lambda has_email, has_phone: has_phone,
+    "С email и телефоном": lambda has_email, has_phone: has_email and has_phone,
+    "Только телефон": lambda has_email, has_phone: has_phone and not has_email,
+    "Без email": lambda has_email, has_phone: not has_email,
+    "Без контактов": lambda has_email, has_phone: not has_email and not has_phone,
+}
 
 MATCH_METHOD_LABELS = {
     "reply_headers": "По цепочке письма",
@@ -328,22 +341,25 @@ class AutomationApp(tk.Tk):
             filters, textvariable=self.candidate_filter_category_var, state="readonly", width=20
         )
         self.candidate_filter_category_box.grid(row=0, column=3, padx=(6, 0))
-        self.candidate_filter_email_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(filters, text="С email", variable=self.candidate_filter_email_var,
-                        command=self._fill_candidates_tree).grid(row=0, column=4, padx=(6, 0))
+        self.candidate_filter_contacts_var = tk.StringVar(value=ANY_CONTACTS)
+        ttk.Combobox(
+            filters, textvariable=self.candidate_filter_contacts_var, state="readonly", width=19,
+            values=list(CONTACT_FILTERS),
+        ).grid(row=0, column=4, padx=(6, 0))
         ttk.Button(filters, text="Сбросить", command=self._reset_candidate_filters).grid(
             row=0, column=5, padx=(6, 0)
         )
         for variable in (self.candidate_filter_text_var, self.candidate_filter_status_var,
-                         self.candidate_filter_category_var):
+                         self.candidate_filter_category_var, self.candidate_filter_contacts_var):
             variable.trace_add("write", lambda *_args: self._fill_candidates_tree())
 
         self.candidates_tree = self._make_tree(left, [
-            ("name", "Компания", 240),
-            ("categories", "Категории", 220),
-            ("region", "Регион", 130),
-            ("email", "Email", 190),
-            ("status", "Статус", 120),
+            ("name", "Компания", 230),
+            ("categories", "Категории", 200),
+            ("region", "Регион", 120),
+            ("email", "Email", 180),
+            ("phone", "Телефон", 150),
+            ("status", "Статус", 110),
         ], selectmode="extended")
         self.candidates_tree.grid(row=1, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(left, orient="vertical", command=self.candidates_tree.yview)
@@ -394,13 +410,19 @@ class AutomationApp(tk.Tk):
         self.candidate_region_var = tk.StringVar()
         self.candidate_categories_var = tk.StringVar()
         self.candidate_contact_url_var = tk.StringVar()
+        self.candidate_phones_var = tk.StringVar()
+        self.candidate_person_var = tk.StringVar()
+        self.candidate_address_var = tk.StringVar()
         fields = [
             ("Компания", self.candidate_name_var),
             ("Сайт", self.candidate_site_var),
             ("Email", self.candidate_email_var),
+            ("Телефоны через запятую", self.candidate_phones_var),
+            ("Контактное лицо", self.candidate_person_var),
+            ("Адрес", self.candidate_address_var),
             ("Регион", self.candidate_region_var),
             ("Категории через запятую", self.candidate_categories_var),
-            ("Страница с email", self.candidate_contact_url_var),
+            ("Страница с контактами", self.candidate_contact_url_var),
         ]
         for row_index, (label, variable) in enumerate(fields):
             ttk.Label(details, text=label).grid(row=2 * row_index, column=0, sticky="w")
@@ -1128,24 +1150,32 @@ class AutomationApp(tk.Tk):
         search = self.candidate_filter_text_var.get()
         status_label = self.candidate_filter_status_var.get()
         category = self.candidate_filter_category_var.get().casefold()
-        only_with_email = self.candidate_filter_email_var.get()
+        contacts_match = CONTACT_FILTERS.get(
+            self.candidate_filter_contacts_var.get(), CONTACT_FILTERS[ANY_CONTACTS]
+        )
         for candidate_id, row in self._candidate_rows.items():
             categories = json.loads(row["categories_json"])
+            phones = json.loads(row["phones_json"])
             status = CANDIDATE_STATUS_LABELS.get(row["status"], row["status"])
             if status_label != ALL_STATUSES and status != status_label:
                 continue
             if (category != ALL_CATEGORIES.casefold() and
                     category not in (value.casefold() for value in categories)):
                 continue
-            if only_with_email and not row["email"]:
+            if not contacts_match(bool(row["email"]), bool(phones)):
                 continue
             if not text_matches(search, row["name"], row["email"], row["website"],
                                 row["region"], row["evidence"], row["search_query"],
-                                " ".join(categories)):
+                                " ".join(categories), " ".join(phones),
+                                row["contact_person"], row["address"]):
                 continue
+            phone = phones[0] if phones else ""
+            if len(phones) > 1:
+                phone += f" (+{len(phones) - 1})"
             self.candidates_tree.insert(
                 "", "end", iid=str(candidate_id), values=(
-                    row["name"], ", ".join(categories), row["region"], row["email"], status,
+                    row["name"], ", ".join(categories), row["region"], row["email"], phone,
+                    status,
                 )
             )
         visible = [iid for iid in selected if self.candidates_tree.exists(iid)]
@@ -1157,7 +1187,7 @@ class AutomationApp(tk.Tk):
         self.candidate_filter_text_var.set("")
         self.candidate_filter_status_var.set(ALL_STATUSES)
         self.candidate_filter_category_var.set(ALL_CATEGORIES)
-        self.candidate_filter_email_var.set(False)
+        self.candidate_filter_contacts_var.set(ANY_CONTACTS)
         self._fill_candidates_tree()
 
     def _update_candidates_count(self) -> None:
@@ -1186,6 +1216,9 @@ class AutomationApp(tk.Tk):
         self.candidate_region_var.set(row["region"])
         self.candidate_categories_var.set(", ".join(json.loads(row["categories_json"])))
         self.candidate_contact_url_var.set(row["contact_source_url"])
+        self.candidate_phones_var.set(", ".join(json.loads(row["phones_json"])))
+        self.candidate_person_var.set(row["contact_person"])
+        self.candidate_address_var.set(row["address"])
         self.candidate_sources_text.delete("1.0", "end")
         self.candidate_sources_text.insert(
             "1.0", "\n".join(json.loads(row["source_urls_json"]))
@@ -1200,7 +1233,9 @@ class AutomationApp(tk.Tk):
     def _clear_candidate_form(self) -> None:
         for variable in (self.candidate_name_var, self.candidate_site_var,
                          self.candidate_email_var, self.candidate_region_var,
-                         self.candidate_categories_var, self.candidate_contact_url_var):
+                         self.candidate_categories_var, self.candidate_contact_url_var,
+                         self.candidate_phones_var, self.candidate_person_var,
+                         self.candidate_address_var):
             variable.set("")
         self.candidate_sources_text.delete("1.0", "end")
         self.candidate_evidence_text.delete("1.0", "end")
@@ -1303,8 +1338,10 @@ class AutomationApp(tk.Tk):
             website = normalize_web_url(self.candidate_site_var.get())
             email = normalize_email(self.candidate_email_var.get())
             contact_url = normalize_web_url(self.candidate_contact_url_var.get())
-            if email and not contact_url:
-                raise ValueError("Для email укажите страницу, где он опубликован")
+            phones = clean_phones(self.candidate_phones_var.get().split(","))
+            person = self.candidate_person_var.get().strip()
+            if (email or phones or person) and not contact_url:
+                raise ValueError("Для контактов укажите страницу, где они опубликованы")
             sources = list(dict.fromkeys(
                 normalize_web_url(value) for value in
                 self.candidate_sources_text.get("1.0", "end").splitlines() if value.strip()
@@ -1317,6 +1354,8 @@ class AutomationApp(tk.Tk):
                 categories=clean_categories(self.candidate_categories_var.get().split(",")),
                 evidence=self.candidate_evidence_text.get("1.0", "end").strip(),
                 source_urls=sources, contact_source_url=contact_url,
+                phones=phones, contact_person=person,
+                address=self.candidate_address_var.get().strip(),
             )
         except (ValueError, sqlite3.IntegrityError) as exc:
             messagebox.showerror("Кандидат", str(exc), parent=self)

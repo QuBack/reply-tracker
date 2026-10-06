@@ -10,12 +10,17 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+PHONE_RE = re.compile(
+    r"^(?P<number>\+?[\d\s().\-]+?)\s*(?:(?:доб\.?|ext\.?|#)\s*(?P<extension>\d{1,6}))?$",
+    re.IGNORECASE,
+)
+MAX_PHONES = 5
 SEARCH_TIMEOUT_SECONDS = 1200
 MAX_COMPANIES = 50
 SEARCH_MODEL = "gpt-6-sol"
@@ -32,6 +37,9 @@ class Candidate:
     evidence: str
     source_urls: list[str]
     contact_source_url: str
+    phones: list[str] = field(default_factory=list)
+    contact_person: str = ""
+    address: str = ""
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,42 @@ def normalize_email(value: str) -> str:
     if value and not EMAIL_RE.fullmatch(value):
         raise ValueError(f"Некорректный email: {value}")
     return value
+
+
+def normalize_phone(value: str) -> str:
+    value = " ".join(str(value).replace("–", "-").replace("—", "-").split())
+    if not value:
+        return ""
+    match = PHONE_RE.fullmatch(value)
+    digits = re.sub(r"\D", "", match.group("number")) if match else ""
+    if not match or not 6 <= len(digits) <= 15 or len(value) > 40:
+        raise ValueError(f"Некорректный телефон: {value}")
+    return value
+
+
+def phone_key(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone)
+    # 8 (495) … и +7 (495) … — один и тот же российский номер.
+    if len(digits) >= 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    return digits
+
+
+def clean_phones(values: list[str], *, skip_invalid: bool = False) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        try:
+            phone = normalize_phone(value)
+        except ValueError:
+            if skip_invalid:
+                continue
+            raise
+        key = phone_key(phone)
+        if phone and key not in seen:
+            seen.add(key)
+            result.append(phone)
+    return result[:MAX_PHONES]
 
 
 def clean_categories(values: list[str]) -> list[str]:
@@ -102,8 +146,8 @@ def parse_codex_result(payload: str) -> SearchResult:
             website = normalize_web_url(str(raw["website"]))
             email = normalize_email(str(raw["email"]))
             region = str(raw["region"]).strip()[:150]
-            if not isinstance(raw["categories"], list) or not isinstance(raw["source_urls"], list):
-                raise ValueError("Списки категорий и источников имеют неверный формат")
+            if not all(isinstance(raw[key], list) for key in ("categories", "source_urls", "phones")):
+                raise ValueError("Списки категорий, источников и телефонов имеют неверный формат")
             categories = clean_categories(raw["categories"])
             evidence = str(raw["evidence"]).strip()[:1000]
             sources = list(dict.fromkeys(
@@ -111,10 +155,13 @@ def parse_codex_result(payload: str) -> SearchResult:
             ))
             sources = [url for url in sources if url][:8]
             contact_source = normalize_web_url(str(raw["contact_source_url"]))
+            phones = clean_phones(raw["phones"], skip_invalid=True)
+            contact_person = str(raw["contact_person"]).strip()[:200]
+            address = str(raw["address"]).strip()[:300]
             if not sources:
                 raise ValueError("Нет источника")
-            if email and not contact_source:
-                raise ValueError("Для email не указан источник")
+            if (email or phones or contact_person) and not contact_source:
+                raise ValueError("Для контактов не указан источник")
             if contact_source and contact_source not in sources:
                 sources.append(contact_source)
             identity = candidate_identity(name, website, email, region)
@@ -122,7 +169,8 @@ def parse_codex_result(payload: str) -> SearchResult:
                 continue
             seen.add(identity)
             candidates.append(Candidate(
-                name, website, email, region, categories, evidence, sources, contact_source
+                name, website, email, region, categories, evidence, sources, contact_source,
+                phones, contact_person, address,
             ))
         except (KeyError, TypeError, ValueError):
             rejected += 1
@@ -141,9 +189,13 @@ def _output_schema() -> dict:
             "evidence": {"type": "string"},
             "source_urls": {"type": "array", "items": {"type": "string"}},
             "contact_source_url": {"type": "string"},
+            "phones": {"type": "array", "items": {"type": "string"}},
+            "contact_person": {"type": "string"},
+            "address": {"type": "string"},
         },
         "required": ["name", "website", "email", "region", "categories", "evidence",
-                     "source_urls", "contact_source_url"],
+                     "source_urls", "contact_source_url", "phones", "contact_person",
+                     "address"],
         "additionalProperties": False,
     }
     return {
@@ -271,7 +323,8 @@ def export_candidates_xlsx(rows: list, path: Path) -> None:
     sheet = workbook.active
     sheet.title = "Найденные поставщики"
     headers = ["Статус", "Компания", "Категории", "Регион", "Email", "Сайт",
-               "Источники", "Источник email", "Подтверждение", "Поисковый запрос"]
+               "Источники", "Источник контактов", "Подтверждение", "Поисковый запрос",
+               "Телефоны", "Контактное лицо", "Адрес"]
     sheet.append(headers)
     for row in rows:
         sheet.append([safe_text(value) for value in [
@@ -281,12 +334,14 @@ def export_candidates_xlsx(rows: list, path: Path) -> None:
             row["email"], row["website"],
             "\n".join(json.loads(row["source_urls_json"])), row["contact_source_url"],
             row["evidence"], row["search_query"] or "",
+            "\n".join(json.loads(row["phones_json"])), row["contact_person"], row["address"],
         ]])
     for cell in sheet[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="17324D")
     for column, width in {"A": 16, "B": 32, "C": 30, "D": 22, "E": 28,
-                          "F": 38, "G": 52, "H": 45, "I": 60, "J": 40}.items():
+                          "F": 38, "G": 52, "H": 45, "I": 60, "J": 40,
+                          "K": 24, "L": 28, "M": 40}.items():
         sheet.column_dimensions[column].width = width
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions

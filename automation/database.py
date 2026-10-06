@@ -13,6 +13,19 @@ TERMINAL_RECIPIENT_STATUSES = ("files_received", "declined", "closed_no_response
 WAITING_RECIPIENT_STATUSES = ("pending", "sent", "reply_without_files", "send_failed", "send_unknown")
 
 
+def candidate_supplier_notes(candidate: sqlite3.Row) -> str:
+    sources = ", ".join(json.loads(candidate["source_urls_json"]))
+    lines = [f"Найден через поиск. Источники: {sources}"]
+    phones = json.loads(candidate["phones_json"])
+    if phones:
+        lines.append("Телефоны: " + ", ".join(phones))
+    if candidate["contact_person"]:
+        lines.append("Контактное лицо: " + candidate["contact_person"])
+    if candidate["address"]:
+        lines.append("Адрес: " + candidate["address"])
+    return "\n".join(lines)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -62,6 +75,9 @@ CREATE TABLE IF NOT EXISTS supplier_candidates (
     evidence TEXT NOT NULL DEFAULT '',
     source_urls_json TEXT NOT NULL DEFAULT '[]',
     contact_source_url TEXT NOT NULL DEFAULT '',
+    phones_json TEXT NOT NULL DEFAULT '[]',
+    contact_person TEXT NOT NULL DEFAULT '',
+    address TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'new',
     supplier_id INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
@@ -248,6 +264,18 @@ class Database:
                 connection.execute(
                     "ALTER TABLE suppliers ADD COLUMN excluded_reason TEXT NOT NULL DEFAULT ''"
                 )
+            candidate_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(supplier_candidates)")
+            }
+            for column, definition in (
+                ("phones_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("contact_person", "TEXT NOT NULL DEFAULT ''"),
+                ("address", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column not in candidate_columns:
+                    connection.execute(
+                        f"ALTER TABLE supplier_candidates ADD COLUMN {column} {definition}"
+                    )
             columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(incoming_messages)")
             }
@@ -419,7 +447,7 @@ class Database:
             ).fetchone()
 
     def import_candidates(self, query: str, region: str, candidates: Iterable[Any]) -> tuple[int, int]:
-        from .supplier_search import candidate_identity
+        from .supplier_search import candidate_identity, clean_phones
 
         items = list(candidates)
         now = utc_now()
@@ -441,16 +469,22 @@ class Database:
                     categories = (old_categories if existing["status"] == "approved" else
                                   list(dict.fromkeys(old_categories + item.categories)))
                     sources = list(dict.fromkeys(old_sources + item.source_urls))
+                    phones = clean_phones(json.loads(existing["phones_json"]) + item.phones,
+                                          skip_invalid=True)
                     connection.execute(
                         "UPDATE supplier_candidates SET search_id = ?, website = ?, email = ?, "
                         "region = ?, categories_json = ?, evidence = ?, source_urls_json = ?, "
-                        "contact_source_url = ?, updated_at = ? WHERE id = ?",
+                        "contact_source_url = ?, phones_json = ?, contact_person = ?, "
+                        "address = ?, updated_at = ? WHERE id = ?",
                         (search_id, existing["website"] or item.website,
                          existing["email"] or item.email, existing["region"] or item.region,
                          json.dumps(categories, ensure_ascii=False),
                          existing["evidence"] or item.evidence,
                          json.dumps(sources, ensure_ascii=False),
                          existing["contact_source_url"] or item.contact_source_url,
+                         json.dumps(phones, ensure_ascii=False),
+                         existing["contact_person"] or item.contact_person,
+                         existing["address"] or item.address,
                          now, existing["id"]),
                     )
                 else:
@@ -458,11 +492,13 @@ class Database:
                         "INSERT INTO supplier_candidates "
                         "(search_id, identity_key, name, website, email, region, "
                         "categories_json, evidence, source_urls_json, contact_source_url, "
-                        "created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "phones_json, contact_person, address, created_at, updated_at) "
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (search_id, identity, item.name, item.website, item.email, item.region,
                          json.dumps(item.categories, ensure_ascii=False), item.evidence,
                          json.dumps(item.source_urls, ensure_ascii=False), item.contact_source_url,
-                         now, now),
+                         json.dumps(item.phones, ensure_ascii=False), item.contact_person,
+                         item.address, now, now),
                     )
                     added += 1
         self.log("info", "supplier_search", None, {
@@ -472,7 +508,9 @@ class Database:
 
     def update_candidate(self, candidate_id: int, *, name: str, website: str, email: str,
                          region: str, categories: Iterable[str], evidence: str,
-                         source_urls: Iterable[str], contact_source_url: str) -> None:
+                         source_urls: Iterable[str], contact_source_url: str,
+                         phones: Iterable[str] = (), contact_person: str = "",
+                         address: str = "") -> None:
         from .supplier_search import candidate_identity
 
         identity = candidate_identity(name, website, email, region)
@@ -487,11 +525,13 @@ class Database:
             connection.execute(
                 "UPDATE supplier_candidates SET identity_key = ?, name = ?, website = ?, "
                 "email = ?, region = ?, categories_json = ?, evidence = ?, "
-                "source_urls_json = ?, contact_source_url = ?, updated_at = ? WHERE id = ?",
+                "source_urls_json = ?, contact_source_url = ?, phones_json = ?, "
+                "contact_person = ?, address = ?, updated_at = ? WHERE id = ?",
                 (identity, name.strip(), website.strip(), email.strip().lower(), region.strip(),
                  json.dumps(list(categories), ensure_ascii=False), evidence.strip(),
                  json.dumps(list(source_urls), ensure_ascii=False), contact_source_url.strip(),
-                 utc_now(), candidate_id),
+                 json.dumps(list(phones), ensure_ascii=False), contact_person.strip(),
+                 address.strip(), utc_now(), candidate_id),
             )
 
     def set_candidate_status(self, candidate_id: int, status: str) -> None:
@@ -616,8 +656,7 @@ class Database:
                 cursor = connection.execute(
                     "INSERT INTO suppliers(name, email, notes, created_at, updated_at) "
                     "VALUES(?, ?, ?, ?, ?)",
-                    (candidate["name"], candidate["email"],
-                     f"Найден через поиск. Источники: {', '.join(json.loads(candidate['source_urls_json']))}",
+                    (candidate["name"], candidate["email"], candidate_supplier_notes(candidate),
                      now, now),
                 )
                 supplier_id = int(cursor.lastrowid)
