@@ -43,7 +43,7 @@ class SupplierSearchTests(unittest.TestCase):
         self.assertEqual((added, existing), (1, 0))
         row = self.db.list_candidates()[0]
         self.assertEqual(row["status"], "new")
-        with self.assertRaisesRegex(ValueError, "email"):
+        with self.assertRaisesRegex(ValueError, "email или телефон"):
             self.db.approve_candidate(int(row["id"]))
         self.assertEqual(self.db.list_suppliers(), [])
 
@@ -149,7 +149,7 @@ class SupplierSearchTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 normalize_phone(bad)
 
-    def test_contacts_are_merged_and_copied_to_supplier_notes(self) -> None:
+    def test_contacts_are_merged_and_copied_to_supplier(self) -> None:
         self.db.import_candidates("цилиндры", "Россия", [sample_candidate(
             email="", phones=["+7 495 123-45-67"], address="Москва",
         )])
@@ -162,9 +162,69 @@ class SupplierSearchTests(unittest.TestCase):
                          ["+7 495 123-45-67", "+7 495 765-43-21"])
         self.assertEqual((row["contact_person"], row["address"]), ("Петров П.", "Москва"))
         self.db.approve_candidate(int(row["id"]))
-        notes = self.db.list_suppliers()[0]["notes"]
-        self.assertIn("Телефоны: +7 495 123-45-67, +7 495 765-43-21", notes)
-        self.assertIn("Контактное лицо: Петров П.", notes)
+        supplier = self.db.list_suppliers()[0]
+        self.assertEqual(json.loads(supplier["phones_json"]),
+                         ["+7 495 123-45-67", "+7 495 765-43-21"])
+        self.assertEqual((supplier["contact_person"], supplier["address"], supplier["website"]),
+                         ("Петров П.", "Москва", "https://www.gidro.example.ru"))
+
+    def test_manually_entered_phone_is_enough_for_catalog(self) -> None:
+        # Сайт закрыт от бота: контакты вписаны вручную, без страницы-источника.
+        self.db.import_candidates("насосы", "Россия", [
+            sample_candidate(email="", contact_source_url=""),
+            sample_candidate(name="Второй", website="https://second.example.ru", email="",
+                             contact_source_url=""),
+        ])
+        rows = {row["name"]: row for row in self.db.list_candidates()}
+        first = rows["Завод Гидропривод"]
+        self.db.update_candidate(
+            int(first["id"]), name=first["name"], website=first["website"], email="",
+            region=first["region"], categories=["Насосы"], evidence="",
+            source_urls=[], contact_source_url="", phones=["+7 495 123-45-67"],
+        )
+        first_supplier = self.db.approve_candidate(int(first["id"]))
+        self.db.update_candidate(
+            int(rows["Второй"]["id"]), name="Второй", website="https://second.example.ru",
+            email="", region="", categories=[], evidence="", source_urls=[],
+            contact_source_url="", phones=["+7 812 000-00-00"],
+        )
+        self.db.approve_candidate(int(rows["Второй"]["id"]))
+        suppliers = {row["name"]: row for row in self.db.list_suppliers()}
+        self.assertEqual(len(suppliers), 2)  # несколько поставщиков без email не конфликтуют
+        self.assertIsNone(suppliers["Завод Гидропривод"]["email"])
+        self.assertEqual(json.loads(suppliers["Завод Гидропривод"]["phones_json"]),
+                         ["+7 495 123-45-67"])
+        with self.assertRaisesRegex(ValueError, "нет email"):
+            self.db.create_campaign("Тест", "Запрос", "Текст", None, [first_supplier])
+
+    def test_supplier_needs_email_or_phone(self) -> None:
+        with self.assertRaisesRegex(ValueError, "email или телефон"):
+            self.db.save_supplier("Без контактов", "")
+        self.assertEqual(self.db.list_suppliers(), [])
+        supplier_id = self.db.save_supplier("Телефон", "", phones=["+7 495 123-45-67"],
+                                            contact_person="Иванов", website="https://t.ru")
+        self.db.save_supplier("Телефон", "sales@t.ru", supplier_id=supplier_id)
+        row = self.db.list_suppliers()[0]
+        # Контакты, не переданные при сохранении, не стираются.
+        self.assertEqual((row["email"], row["contact_person"], row["website"]),
+                         ("sales@t.ru", "Иванов", "https://t.ru"))
+        with self.assertRaisesRegex(ValueError, "email или телефон"):
+            self.db.save_supplier("Телефон", "", supplier_id=supplier_id, phones=[])
+        self.assertEqual(self.db.list_suppliers()[0]["email"], "sales@t.ru")
+
+    def test_existing_supplier_gets_missing_contacts_on_approval(self) -> None:
+        existing_id = self.db.save_supplier("Старое", "sales@gidro.example.ru",
+                                            phones=["+7 495 111-11-11"], address="Москва")
+        self.db.import_candidates("цилиндры", "Россия", [sample_candidate(
+            phones=["8 495 111-11-11", "+7 495 222-22-22"], contact_person="Петров",
+            address="Тула",
+        )])
+        self.assertEqual(self.db.approve_candidate(int(self.db.list_candidates()[0]["id"])),
+                         existing_id)
+        row = self.db.list_suppliers()[0]
+        self.assertEqual(json.loads(row["phones_json"]), ["+7 495 111-11-11", "+7 495 222-22-22"])
+        self.assertEqual((row["name"], row["contact_person"], row["address"]),
+                         ("Старое", "Петров", "Москва"))
 
     def test_existing_candidates_table_gets_contact_columns(self) -> None:
         legacy = Path(self.temp.name) / "legacy-candidates.db"

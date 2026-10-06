@@ -9,21 +9,14 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 
+SUPPLIER_CONTACT_COLUMNS = (
+    ("phones_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("contact_person", "TEXT NOT NULL DEFAULT ''"),
+    ("address", "TEXT NOT NULL DEFAULT ''"),
+    ("website", "TEXT NOT NULL DEFAULT ''"),
+)
 TERMINAL_RECIPIENT_STATUSES = ("files_received", "declined", "closed_no_response")
 WAITING_RECIPIENT_STATUSES = ("pending", "sent", "reply_without_files", "send_failed", "send_unknown")
-
-
-def candidate_supplier_notes(candidate: sqlite3.Row) -> str:
-    sources = ", ".join(json.loads(candidate["source_urls_json"]))
-    lines = [f"Найден через поиск. Источники: {sources}"]
-    phones = json.loads(candidate["phones_json"])
-    if phones:
-        lines.append("Телефоны: " + ", ".join(phones))
-    if candidate["contact_person"]:
-        lines.append("Контактное лицо: " + candidate["contact_person"])
-    if candidate["address"]:
-        lines.append("Адрес: " + candidate["address"])
-    return "\n".join(lines)
 
 
 def utc_now() -> str:
@@ -41,10 +34,14 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS suppliers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
-    email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    email TEXT COLLATE NOCASE UNIQUE,
     notes TEXT NOT NULL DEFAULT '',
     excluded INTEGER NOT NULL DEFAULT 0,
     excluded_reason TEXT NOT NULL DEFAULT '',
+    phones_json TEXT NOT NULL DEFAULT '[]',
+    contact_person TEXT NOT NULL DEFAULT '',
+    address TEXT NOT NULL DEFAULT '',
+    website TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -264,6 +261,15 @@ class Database:
                 connection.execute(
                     "ALTER TABLE suppliers ADD COLUMN excluded_reason TEXT NOT NULL DEFAULT ''"
                 )
+            for column, definition in SUPPLIER_CONTACT_COLUMNS:
+                if column not in supplier_columns:
+                    connection.execute(f"ALTER TABLE suppliers ADD COLUMN {column} {definition}")
+            email_required = any(
+                row["name"] == "email" and row["notnull"]
+                for row in connection.execute("PRAGMA table_info(suppliers)")
+            )
+            if email_required:
+                self._migrate_suppliers_optional_email(connection)
             candidate_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(supplier_candidates)")
             }
@@ -290,6 +296,52 @@ class Database:
                     "ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'sent'"
                 )
             connection.execute("PRAGMA user_version = 3")
+
+    def _migrate_suppliers_optional_email(self, connection: sqlite3.Connection) -> None:
+        # Поставщика можно завести только с телефоном, поэтому email становится
+        # необязательным. Ограничение NOT NULL снимается лишь пересозданием таблицы.
+        connection.commit()
+        snapshot = self.path.with_name(
+            f"{self.path.stem}.pre-v4-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.db"
+        )
+        self.backup_to(snapshot)
+        columns = ("id, name, email, notes, excluded, excluded_reason, phones_json, "
+                   "contact_person, address, website, created_at, updated_at")
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                CREATE TABLE suppliers_v4 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    email TEXT COLLATE NOCASE UNIQUE,
+                    notes TEXT NOT NULL DEFAULT '',
+                    excluded INTEGER NOT NULL DEFAULT 0,
+                    excluded_reason TEXT NOT NULL DEFAULT '',
+                    phones_json TEXT NOT NULL DEFAULT '[]',
+                    contact_person TEXT NOT NULL DEFAULT '',
+                    address TEXT NOT NULL DEFAULT '',
+                    website TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                f"INSERT INTO suppliers_v4 ({columns}) SELECT {columns} FROM suppliers"
+            )
+            connection.execute("UPDATE suppliers_v4 SET email = NULL WHERE email = ''")
+            connection.execute("DROP TABLE suppliers")
+            connection.execute("ALTER TABLE suppliers_v4 RENAME TO suppliers")
+            if connection.execute("PRAGMA foreign_key_check").fetchone():
+                raise sqlite3.DatabaseError("После миграции нарушены связи в базе данных")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
 
     def _migrate_incoming_messages(self, connection: sqlite3.Connection) -> None:
         snapshot = self.path.with_name(
@@ -386,29 +438,52 @@ class Database:
     def save_supplier(self, name: str, email: str, notes: str = "",
                       supplier_id: int | None = None,
                       categories: Iterable[str] | None = None,
-                      excluded: bool | None = None, excluded_reason: str = "") -> int:
+                      excluded: bool | None = None, excluded_reason: str = "", *,
+                      phones: Iterable[str] | None = None, contact_person: str | None = None,
+                      address: str | None = None, website: str | None = None) -> int:
+        """Сохраняет поставщика; контактные поля со значением None не меняются."""
         now = utc_now()
         email = email.strip().lower()
         reason = excluded_reason.strip() if excluded else ""
+        contacts = {
+            "phones_json": None if phones is None else json.dumps(list(phones), ensure_ascii=False),
+            "contact_person": None if contact_person is None else contact_person.strip(),
+            "address": None if address is None else address.strip(),
+            "website": None if website is None else website.strip(),
+        }
         with self.connect() as connection:
             if supplier_id is None:
                 cursor = connection.execute(
                     "INSERT INTO suppliers(name, email, notes, excluded, excluded_reason, "
                     "created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
-                    (name.strip(), email, notes.strip(), int(bool(excluded)), reason, now, now),
+                    (name.strip(), email or None, notes.strip(), int(bool(excluded)), reason,
+                     now, now),
                 )
                 result = int(cursor.lastrowid)
             else:
                 connection.execute(
                     "UPDATE suppliers SET name = ?, email = ?, notes = ?, updated_at = ? WHERE id = ?",
-                    (name.strip(), email, notes.strip(), now, supplier_id),
+                    (name.strip(), email or None, notes.strip(), now, supplier_id),
                 )
+                result = supplier_id
+            for column, value in contacts.items():
+                if value is not None:
+                    connection.execute(
+                        f"UPDATE suppliers SET {column} = ? WHERE id = ?", (value, result)
+                    )
+            row = connection.execute(
+                "SELECT email, phones_json FROM suppliers WHERE id = ?", (result,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("Поставщик не найден")
+            if not row["email"] and not json.loads(row["phones_json"]):
+                raise ValueError("Укажите email или телефон поставщика")
+            if supplier_id is not None:
                 if excluded is not None:
                     connection.execute(
                         "UPDATE suppliers SET excluded = ?, excluded_reason = ? WHERE id = ?",
                         (int(excluded), reason, supplier_id),
                     )
-                result = supplier_id
             if categories is not None:
                 self._replace_supplier_categories(connection, result, categories)
         self.log("info", "supplier_saved", None, {
@@ -632,32 +707,49 @@ class Database:
         return changed
 
     def approve_candidate(self, candidate_id: int) -> int:
+        from .supplier_search import clean_phones
+
         with self.connect() as connection:
             candidate = connection.execute(
                 "SELECT * FROM supplier_candidates WHERE id = ?", (candidate_id,)
             ).fetchone()
             if candidate is None:
                 raise ValueError("Кандидат не найден")
-            if not candidate["email"]:
-                raise ValueError("Перед добавлением поставщика нужен подтверждённый email")
+            phones = json.loads(candidate["phones_json"])
+            if not candidate["email"] and not phones:
+                raise ValueError("Перед добавлением укажите email или телефон")
             if candidate["status"] == "approved" and candidate["supplier_id"]:
                 return int(candidate["supplier_id"])
             supplier = connection.execute(
-                "SELECT id FROM suppliers WHERE email = ? COLLATE NOCASE",
+                "SELECT * FROM suppliers WHERE email = ? COLLATE NOCASE",
                 (candidate["email"],),
-            ).fetchone()
+            ).fetchone() if candidate["email"] else None
             now = utc_now()
             if supplier:
                 supplier_id = int(supplier["id"])
                 existing_categories = [row["category"] for row in connection.execute(
                     "SELECT category FROM supplier_categories WHERE supplier_id = ?", (supplier_id,)
                 )]
+                # Название и заметки остаются прежними, недостающие контакты дополняются.
+                connection.execute(
+                    "UPDATE suppliers SET phones_json = ?, contact_person = ?, address = ?, "
+                    "website = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(clean_phones(json.loads(supplier["phones_json"]) + phones,
+                                             skip_invalid=True), ensure_ascii=False),
+                     supplier["contact_person"] or candidate["contact_person"],
+                     supplier["address"] or candidate["address"],
+                     supplier["website"] or candidate["website"], now, supplier_id),
+                )
             else:
+                sources = ", ".join(json.loads(candidate["source_urls_json"]))
                 cursor = connection.execute(
-                    "INSERT INTO suppliers(name, email, notes, created_at, updated_at) "
-                    "VALUES(?, ?, ?, ?, ?)",
-                    (candidate["name"], candidate["email"], candidate_supplier_notes(candidate),
-                     now, now),
+                    "INSERT INTO suppliers(name, email, notes, phones_json, contact_person, "
+                    "address, website, created_at, updated_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (candidate["name"], candidate["email"] or None,
+                     f"Найден через поиск. Источники: {sources}",
+                     candidate["phones_json"], candidate["contact_person"], candidate["address"],
+                     candidate["website"], now, now),
                 )
                 supplier_id = int(cursor.lastrowid)
                 existing_categories = []
@@ -724,6 +816,9 @@ class Database:
                 raise ValueError(
                     "Эти поставщики исключены из рассылок: " + ", ".join(excluded)
                 )
+            without_email = [row["name"] for row in suppliers if not row["email"]]
+            if without_email:
+                raise ValueError("У этих поставщиков нет email: " + ", ".join(without_email))
             connection.executemany(
                 "INSERT INTO campaign_recipients(campaign_id, supplier_id, email) VALUES(?, ?, ?)",
                 ((campaign_id, row["id"], row["email"]) for row in suppliers),

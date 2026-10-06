@@ -84,6 +84,32 @@ class DatabaseTests(unittest.TestCase):
         row = Database(legacy).list_suppliers()[0]
         self.assertEqual((row["name"], row["excluded"], row["excluded_reason"]), ("Старый", 0, ""))
 
+    def test_existing_suppliers_table_allows_supplier_without_email(self) -> None:
+        legacy = Path(self.temp.name) / "legacy-v3.db"
+        Database(legacy)
+        with closing(sqlite3.connect(legacy)) as connection:
+            connection.executescript(
+                "PRAGMA foreign_keys = OFF;"
+                "DROP TABLE suppliers;"
+                "CREATE TABLE suppliers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, "
+                "email TEXT NOT NULL COLLATE NOCASE UNIQUE, notes TEXT NOT NULL DEFAULT '', "
+                "excluded INTEGER NOT NULL DEFAULT 0, excluded_reason TEXT NOT NULL DEFAULT '', "
+                "created_at TEXT NOT NULL, updated_at TEXT NOT NULL);"
+                "INSERT INTO suppliers(id, name, email, created_at, updated_at) "
+                "VALUES (1, 'Старый', 'old@example.ru', 'x', 'x');"
+                "INSERT INTO supplier_categories VALUES (1, 'Насосы');"
+            )
+        upgraded = Database(legacy)
+        self.assertEqual(upgraded.list_categories(), ["Насосы"])
+        upgraded.save_supplier("Без почты 1", "", phones=["+7 495 000-00-01"])
+        upgraded.save_supplier("Без почты 2", "", phones=["+7 495 000-00-02"])
+        rows = {row["name"]: row for row in upgraded.list_suppliers()}
+        self.assertEqual(rows["Старый"]["email"], "old@example.ru")
+        self.assertIsNone(rows["Без почты 1"]["email"])
+        upgraded.delete_supplier(1)  # каскадное удаление категорий по-прежнему работает
+        self.assertEqual(upgraded.list_categories(), [])
+        self.assertTrue(list(Path(self.temp.name).glob("legacy-v3.pre-v4-*.db")))
+
     def test_settings_round_trip(self) -> None:
         self.db.set_settings({"email_address": "box@mail.ru", "check_interval_minutes": "15"})
         self.assertEqual(self.db.get_setting("email_address"), "box@mail.ru")

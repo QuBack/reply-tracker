@@ -82,6 +82,20 @@ def incoming_result_label(row: sqlite3.Row) -> str:
     return "Ответ без файлов"
 
 
+def normalize_site_input(value: str) -> str:
+    """Ссылка, введённая вручную: «example.ru» превращается в https://example.ru."""
+    value = value.strip()
+    if value and "://" not in value:
+        value = "https://" + value
+    return normalize_web_url(value)
+
+
+def phones_summary(phones: list[str]) -> str:
+    if len(phones) > 1:
+        return f"{phones[0]} (+{len(phones) - 1})"
+    return phones[0] if phones else ""
+
+
 def text_matches(query: str, *fields: str) -> bool:
     words = query.casefold().split()
     haystack = " ".join(str(field or "") for field in fields).casefold()
@@ -215,14 +229,22 @@ class AutomationApp(tk.Tk):
         )
         self.supplier_filter_box.grid(row=0, column=2, padx=(8, 0))
         self.supplier_filter_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_suppliers())
+        self.supplier_contacts_var = tk.StringVar(value=ANY_CONTACTS)
+        supplier_contacts_box = ttk.Combobox(
+            filters, textvariable=self.supplier_contacts_var, state="readonly", width=19,
+            values=list(CONTACT_FILTERS),
+        )
+        supplier_contacts_box.grid(row=0, column=3, padx=(8, 0))
+        supplier_contacts_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_suppliers())
         self.suppliers_tree = self._make_tree(
             left,
             [
-                ("name", "Поставщик", 260),
-                ("email", "Email", 260),
-                ("categories", "Категории", 230),
+                ("name", "Поставщик", 240),
+                ("email", "Email", 220),
+                ("phone", "Телефон", 150),
+                ("categories", "Категории", 210),
                 ("excluded", "Рассылки", 110),
-                ("notes", "Заметки", 260),
+                ("notes", "Заметки", 220),
             ],
             selectmode="extended",
         )
@@ -257,32 +279,43 @@ class AutomationApp(tk.Tk):
         form.columnconfigure(0, weight=1)
         self.supplier_name_var = tk.StringVar()
         self.supplier_email_var = tk.StringVar()
+        self.supplier_phones_var = tk.StringVar()
+        self.supplier_person_var = tk.StringVar()
+        self.supplier_address_var = tk.StringVar()
+        self.supplier_site_var = tk.StringVar()
         self.supplier_categories_var = tk.StringVar()
-        ttk.Label(form, text="Название").grid(row=0, column=0, sticky="w")
-        ttk.Entry(form, textvariable=self.supplier_name_var).grid(row=1, column=0, sticky="ew", pady=(3, 12))
-        ttk.Label(form, text="Email").grid(row=2, column=0, sticky="w")
-        ttk.Entry(form, textvariable=self.supplier_email_var).grid(row=3, column=0, sticky="ew", pady=(3, 12))
-        ttk.Label(form, text="Категории (через запятую)").grid(row=4, column=0, sticky="w")
-        ttk.Entry(form, textvariable=self.supplier_categories_var).grid(
-            row=5, column=0, sticky="ew", pady=(3, 12)
-        )
-        ttk.Label(form, text="Заметки").grid(row=6, column=0, sticky="w")
-        self.supplier_notes = scrolledtext.ScrolledText(form, height=8, wrap="word", font=("Segoe UI", 9))
-        self.supplier_notes.grid(row=7, column=0, sticky="nsew", pady=(3, 12))
-        form.rowconfigure(7, weight=1)
+        fields = [
+            ("Название", self.supplier_name_var),
+            ("Email (нужен для рассылок)", self.supplier_email_var),
+            ("Телефоны через запятую", self.supplier_phones_var),
+            ("Контактное лицо", self.supplier_person_var),
+            ("Адрес", self.supplier_address_var),
+            ("Сайт", self.supplier_site_var),
+            ("Категории (через запятую)", self.supplier_categories_var),
+        ]
+        for index, (label, variable) in enumerate(fields):
+            ttk.Label(form, text=label).grid(row=2 * index, column=0, sticky="w")
+            ttk.Entry(form, textvariable=variable).grid(
+                row=2 * index + 1, column=0, sticky="ew", pady=(2, 6)
+            )
+        row = 2 * len(fields)
+        ttk.Label(form, text="Заметки").grid(row=row, column=0, sticky="w")
+        self.supplier_notes = scrolledtext.ScrolledText(form, height=4, wrap="word", font=("Segoe UI", 9))
+        self.supplier_notes.grid(row=row + 1, column=0, sticky="nsew", pady=(2, 8))
+        form.rowconfigure(row + 1, weight=1)
         self.supplier_excluded_var = tk.BooleanVar(value=False)
         self.supplier_excluded_reason_var = tk.StringVar()
         ttk.Checkbutton(
             form, text="Исключён — не отправлять запросы",
             variable=self.supplier_excluded_var, command=self._update_exclusion_reason_state,
-        ).grid(row=8, column=0, sticky="w")
-        ttk.Label(form, text="Причина исключения").grid(row=9, column=0, sticky="w", pady=(6, 0))
+        ).grid(row=row + 2, column=0, sticky="w")
+        ttk.Label(form, text="Причина исключения").grid(row=row + 3, column=0, sticky="w", pady=(4, 0))
         self.supplier_excluded_reason_entry = ttk.Entry(
             form, textvariable=self.supplier_excluded_reason_var, state="disabled"
         )
-        self.supplier_excluded_reason_entry.grid(row=10, column=0, sticky="ew", pady=(3, 12))
+        self.supplier_excluded_reason_entry.grid(row=row + 4, column=0, sticky="ew", pady=(2, 8))
         actions = ttk.Frame(form)
-        actions.grid(row=11, column=0, sticky="ew")
+        actions.grid(row=row + 5, column=0, sticky="ew")
         ttk.Button(actions, text="Новая", command=self._clear_supplier_form).pack(side="left")
         ttk.Button(actions, text="Сохранить", command=self._save_supplier).pack(side="left", padx=6)
         ttk.Button(actions, text="Удалить", command=self._delete_supplier).pack(side="left")
@@ -422,7 +455,7 @@ class AutomationApp(tk.Tk):
             ("Адрес", self.candidate_address_var),
             ("Регион", self.candidate_region_var),
             ("Категории через запятую", self.candidate_categories_var),
-            ("Страница с контактами", self.candidate_contact_url_var),
+            ("Страница с контактами (необязательно)", self.candidate_contact_url_var),
         ]
         for row_index, (label, variable) in enumerate(fields):
             ttk.Label(details, text=label).grid(row=2 * row_index, column=0, sticky="w")
@@ -879,6 +912,9 @@ class AutomationApp(tk.Tk):
             self.supplier_filter_var.set(ALL_CATEGORIES)
         selected_category = self.supplier_filter_var.get()
         search = self.supplier_search_var.get()
+        contacts_match = CONTACT_FILTERS.get(
+            self.supplier_contacts_var.get(), CONTACT_FILTERS[ANY_CONTACTS]
+        )
         self._campaign_supplier_ids = []
         compose_list = getattr(self, "compose_suppliers_list", None)
         if compose_list is not None and compose_list.winfo_exists():
@@ -889,17 +925,26 @@ class AutomationApp(tk.Tk):
         for row in suppliers:
             iid = str(row["id"])
             row_categories = [value.strip() for value in row["categories"].split(",") if value.strip()]
+            phones = json.loads(row["phones_json"])
             category_ok = (selected_category == ALL_CATEGORIES or
                            selected_category.casefold() in (value.casefold() for value in row_categories))
-            if category_ok and text_matches(search, row["name"], row["email"],
-                                            row["categories"], row["notes"]):
+            if (category_ok and contacts_match(bool(row["email"]), bool(phones)) and
+                    text_matches(search, row["name"], row["email"], row["categories"], row["notes"],
+                                 " ".join(phones), row["contact_person"], row["address"],
+                                 row["website"])):
+                if row["excluded"]:
+                    mailing = "⛔ Исключён"
+                elif not row["email"]:
+                    mailing = "Нет email"
+                else:
+                    mailing = "Да"
                 self.suppliers_tree.insert(
                     "", "end", iid=iid,
-                    values=(row["name"], row["email"], row["categories"],
-                            "⛔ Исключён" if row["excluded"] else "Да", row["notes"]),
+                    values=(row["name"], row["email"] or "", phones_summary(phones),
+                            row["categories"], mailing, row["notes"]),
                     tags=("excluded",) if row["excluded"] else (),
                 )
-            if row["excluded"]:
+            if row["excluded"] or not row["email"]:
                 continue
             self._campaign_supplier_ids.append(int(row["id"]))
             if compose_list is not None:
@@ -1015,7 +1060,11 @@ class AutomationApp(tk.Tk):
         if row is None:
             return
         self.supplier_name_var.set(row["name"])
-        self.supplier_email_var.set(row["email"])
+        self.supplier_email_var.set(row["email"] or "")
+        self.supplier_phones_var.set(", ".join(json.loads(row["phones_json"])))
+        self.supplier_person_var.set(row["contact_person"])
+        self.supplier_address_var.set(row["address"])
+        self.supplier_site_var.set(row["website"])
         self.supplier_categories_var.set(row["categories"])
         self.supplier_notes.delete("1.0", "end")
         self.supplier_notes.insert("1.0", row["notes"])
@@ -1029,9 +1078,11 @@ class AutomationApp(tk.Tk):
 
     def _clear_supplier_fields(self) -> None:
         self._selected_supplier_id = None
-        self.supplier_name_var.set("")
-        self.supplier_email_var.set("")
-        self.supplier_categories_var.set("")
+        for variable in (self.supplier_name_var, self.supplier_email_var,
+                         self.supplier_phones_var, self.supplier_person_var,
+                         self.supplier_address_var, self.supplier_site_var,
+                         self.supplier_categories_var):
+            variable.set("")
         self.supplier_notes.delete("1.0", "end")
         self.supplier_excluded_var.set(False)
         self.supplier_excluded_reason_var.set("")
@@ -1043,12 +1094,13 @@ class AutomationApp(tk.Tk):
         )
 
     def _save_supplier(self) -> None:
-        name = self.supplier_name_var.get().strip()
-        email = self.supplier_email_var.get().strip()
-        if not name or "@" not in email:
-            messagebox.showwarning("Поставщик", "Введите название и корректный email.", parent=self)
-            return
         try:
+            name = self.supplier_name_var.get().strip()
+            if not name:
+                raise ValueError("Введите название поставщика")
+            email = normalize_email(self.supplier_email_var.get())
+            phones = clean_phones(self.supplier_phones_var.get().split(","))
+            website = normalize_site_input(self.supplier_site_var.get())
             supplier_id = self.db.save_supplier(
                 name,
                 email,
@@ -1057,7 +1109,14 @@ class AutomationApp(tk.Tk):
                 categories=clean_categories(self.supplier_categories_var.get().split(",")),
                 excluded=self.supplier_excluded_var.get(),
                 excluded_reason=self.supplier_excluded_reason_var.get(),
+                phones=phones,
+                contact_person=self.supplier_person_var.get(),
+                address=self.supplier_address_var.get(),
+                website=website,
             )
+        except ValueError as exc:
+            messagebox.showwarning("Поставщик", str(exc), parent=self)
+            return
         except sqlite3.IntegrityError:
             messagebox.showerror("Поставщик", "Поставщик с таким email уже существует.", parent=self)
             return
@@ -1169,12 +1228,10 @@ class AutomationApp(tk.Tk):
                                 " ".join(categories), " ".join(phones),
                                 row["contact_person"], row["address"]):
                 continue
-            phone = phones[0] if phones else ""
-            if len(phones) > 1:
-                phone += f" (+{len(phones) - 1})"
             self.candidates_tree.insert(
                 "", "end", iid=str(candidate_id), values=(
-                    row["name"], ", ".join(categories), row["region"], row["email"], phone,
+                    row["name"], ", ".join(categories), row["region"], row["email"],
+                    phones_summary(phones),
                     status,
                 )
             )
@@ -1335,19 +1392,17 @@ class AutomationApp(tk.Tk):
             name = self.candidate_name_var.get().strip()
             if not name:
                 raise ValueError("Введите название компании")
-            website = normalize_web_url(self.candidate_site_var.get())
+            # Контакты можно вписать вручную (например, сайт закрыт от бота),
+            # поэтому страница с контактами и источники необязательны.
+            website = normalize_site_input(self.candidate_site_var.get())
             email = normalize_email(self.candidate_email_var.get())
-            contact_url = normalize_web_url(self.candidate_contact_url_var.get())
+            contact_url = normalize_site_input(self.candidate_contact_url_var.get())
             phones = clean_phones(self.candidate_phones_var.get().split(","))
             person = self.candidate_person_var.get().strip()
-            if (email or phones or person) and not contact_url:
-                raise ValueError("Для контактов укажите страницу, где они опубликованы")
             sources = list(dict.fromkeys(
-                normalize_web_url(value) for value in
+                normalize_site_input(value) for value in
                 self.candidate_sources_text.get("1.0", "end").splitlines() if value.strip()
             ))
-            if not sources:
-                raise ValueError("Укажите хотя бы один источник")
             self.db.update_candidate(
                 self._selected_candidate_id, name=name, website=website, email=email,
                 region=self.candidate_region_var.get().strip(),
