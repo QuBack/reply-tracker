@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import imaplib
+import mimetypes
 import re
 import smtplib
 import ssl
@@ -124,6 +125,12 @@ def sender_email(message: Message) -> str:
     return parseaddr(decode_header_value(message.get("From")))[1].strip().lower()
 
 
+def reply_address(message: Message) -> str:
+    """Адрес для ответа: Reply-To, если он указан, иначе отправитель."""
+    reply_to = parseaddr(decode_header_value(message.get("Reply-To")))[1].strip().lower()
+    return reply_to if "@" in reply_to else sender_email(message)
+
+
 def message_received_at(message: Message) -> str | None:
     value = message.get("Date")
     if not value:
@@ -244,6 +251,8 @@ class MailGateway:
         body: str,
         campaign_code: str,
         attachment_paths: Iterable[Path],
+        in_reply_to: str | None = None,
+        references: Iterable[str] = (),
     ) -> EmailMessage:
         message = EmailMessage(policy=policy.SMTP)
         message["From"] = self.settings.email_address
@@ -253,6 +262,11 @@ class MailGateway:
         domain = self.settings.email_address.rsplit("@", 1)[-1]
         message["Message-ID"] = make_msgid(idstring=campaign_code, domain=domain)
         message["X-Campaign-ID"] = campaign_code
+        if in_reply_to:
+            message["In-Reply-To"] = in_reply_to
+        reference_list = list(references)
+        if reference_list:
+            message["References"] = " ".join(reference_list)
         message.set_content(body)
         for path in attachment_paths:
             payload = path.read_bytes()
@@ -267,7 +281,8 @@ class MailGateway:
             elif suffix == ".xls":
                 maintype, subtype = "application", "vnd.ms-excel"
             else:
-                maintype, subtype = "application", "octet-stream"
+                guessed = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                maintype, subtype = guessed.split("/", 1)
             message.add_attachment(payload, maintype=maintype, subtype=subtype, filename=path.name)
         return message
 

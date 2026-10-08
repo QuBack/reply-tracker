@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 import smtplib
@@ -389,6 +390,110 @@ class MailProviderSettingsTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             service.save_mail_preferences("buyer@company.ru", 10, "secret", "gmail")
+
+
+class ReplyToSupplierTests(unittest.TestCase):
+    """Ответ поставщику продолжает цепочку письма и не меняет состояние адресата."""
+
+    tearDown = ServiceIncomingTests.tearDown
+    _reply = staticmethod(ServiceIncomingTests._reply)
+
+    def setUp(self) -> None:
+        ServiceIncomingTests.setUp(self)
+        self.service.credentials = TestCredentialStore()
+        self.db.set_settings({"email_address": "buyer@mail.ru"})
+
+    def _receive(self, message: EmailMessage, uid: int) -> None:
+        raw = message.as_bytes()
+        self.service._process_incoming(
+            mailbox="buyer@mail.ru", folder="INBOX", uid_validity="42", uid=uid,
+            message=BytesParser(policy=policy.default).parsebytes(raw), raw=raw,
+        )
+
+    def _send(self, draft, **kwargs):
+        actual_build = MailGateway(self.service.mail_settings()).build_message
+        with patch("automation.service.MailGateway") as gateway_class:
+            gateway = gateway_class.return_value
+            gateway.build_message.side_effect = actual_build
+            send = gateway.smtp_session.return_value.__enter__.return_value.send_message
+            if "error" in kwargs:
+                send.side_effect = kwargs.pop("error")
+            try:
+                result = self.service.send_reply(draft, **kwargs)
+            finally:
+                self.sent = [call.args[0] for call in send.call_args_list]
+        return result
+
+    def test_reply_threads_quotes_and_attaches(self) -> None:
+        incoming = self._reply()
+        incoming["Reply-To"] = "Менеджер <manager@example.ru>"
+        self._receive(incoming, 201)
+        incoming_id = int(self.db.list_incoming()[0]["id"])
+        draft = self.service.prepare_reply(incoming_id=incoming_id)
+        self.assertEqual(draft.to_email, "manager@example.ru")
+        self.assertEqual(draft.subject, "Re: Предложение [RFQ-2026-0001]")
+        spec = Path(self.temp.name) / "Спецификация.pdf"
+        spec.write_bytes(b"%PDF-spec")
+
+        self._send(draft, body="Уточните срок поставки.", attachment_paths=[str(spec)])
+
+        message = self.sent[0]
+        self.assertEqual(message["To"], "manager@example.ru")
+        self.assertEqual(message["In-Reply-To"], "<incoming@example.ru>")
+        self.assertEqual(message["References"], "<outgoing@example.ru> <incoming@example.ru>")
+        text = message.get_body(("plain",)).get_content()
+        self.assertTrue(text.startswith("Уточните срок поставки."))
+        self.assertIn("> Добрый день, предложение во вложении.", text)
+        self.assertEqual([part.get_filename() for part in message.iter_attachments()],
+                         ["Спецификация.pdf"])
+        reply = self.db.list_sent_replies(self.campaign_id)[0]
+        self.assertEqual((reply["delivery_status"], reply["to_email"]), ("sent", "manager@example.ru"))
+        self.assertTrue(Path(json.loads(reply["attachments_json"])[0]).is_file())
+        # Состояние адресата остаётся «Файлы получены».
+        recipient_id = int(self.recipient["id"])
+        self.assertEqual(self.db.get_recipient(recipient_id)["status"], "files_received")
+
+        # Следующий ответ поставщика ссылается только на наш ответ и всё равно привязывается.
+        answer = EmailMessage(policy=policy.default)
+        answer["From"] = "manager@example.ru"
+        answer["Subject"] = "Re: Re: Предложение"
+        answer["Message-ID"] = "<answer@example.ru>"
+        answer["In-Reply-To"] = message["Message-ID"]
+        answer.set_content("Срок поставки — 2 недели.")
+        self._receive(answer, 202)
+        latest = self.db.latest_incoming_for_recipient(recipient_id)
+        self.assertEqual((latest["message_id"], latest["match_method"]),
+                         ("<answer@example.ru>", "reply_headers"))
+
+    def test_follow_up_without_answer_replies_to_our_letter(self) -> None:
+        draft = self.service.prepare_reply(recipient_id=int(self.recipient["id"]))
+        self.assertIsNone(draft.incoming_id)
+        self.assertEqual(draft.to_email, "supplier@example.ru")
+        self.assertEqual(draft.in_reply_to, "<outgoing@example.ru>")
+        self.assertEqual(draft.subject, "Re: Предложение [RFQ-2026-0001]")
+        self._send(draft, body="Напоминаем о запросе.", quote=False)
+        text = self.sent[0].get_body(("plain",)).get_content()
+        self.assertEqual(text.strip(), "Напоминаем о запросе.")
+
+    def test_unbound_message_cannot_be_answered(self) -> None:
+        stranger = self._reply()
+        del stranger["In-Reply-To"]
+        stranger.replace_header("Subject", "Вопрос [RFQ-2026-0001]")
+        stranger.replace_header("From", "unknown@example.ru")
+        self._receive(stranger, 203)
+        incoming = self.db.list_incoming()[0]
+        self.assertIsNone(incoming["recipient_id"])
+        with self.assertRaisesRegex(ValueError, "не привязано"):
+            self.service.prepare_reply(incoming_id=int(incoming["id"]))
+
+    def test_rejected_reply_is_marked_failed(self) -> None:
+        draft = self.service.prepare_reply(recipient_id=int(self.recipient["id"]))
+        with self.assertRaisesRegex(RuntimeError, "отклонил"):
+            self._send(draft, body="Текст", error=smtplib.SMTPRecipientsRefused({}))
+        self.assertEqual(self.db.list_sent_replies(self.campaign_id)[0]["delivery_status"],
+                         "failed")
+        with self.assertRaisesRegex(ValueError, "текст"):
+            self.service.send_reply(draft, body="   ")
 
 
 if __name__ == "__main__":

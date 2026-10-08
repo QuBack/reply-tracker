@@ -7,9 +7,11 @@ import sqlite3
 import smtplib
 import threading
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from email import policy
 from email.message import Message
+from email.parser import BytesParser
 from pathlib import Path
 from typing import Iterable
 
@@ -26,6 +28,7 @@ from .mail_gateway import (
     message_received_at,
     message_reference_ids,
     normalize_message_id,
+    reply_address,
     sender_email,
     subject_campaign_code,
 )
@@ -33,6 +36,10 @@ from .paths import AppPaths
 
 
 ALLOWED_RESPONSE_EXTENSIONS = {".pdf", ".xls", ".xlsx"}
+MAX_REPLY_ATTACHMENTS_BYTES = 20 * 1024 * 1024
+REPLY_PREFIX_RE = re.compile(r"^\s*(re|aw|ответ)\s*:", re.IGNORECASE)
+MAX_QUOTED_CHARS = 20_000
+MAX_REFERENCES = 20
 INVALID_WINDOWS_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
@@ -43,6 +50,23 @@ class MatchResult:
     recipient_id: int | None = None
     method: str = "unmatched"
     needs_review: bool = False
+
+
+@dataclass(frozen=True)
+class ReplyDraft:
+    """Всё, что нужно для ответа поставщику в цепочке письма рассылки."""
+
+    campaign_id: int
+    campaign_code: str
+    recipient_id: int
+    supplier_name: str
+    to_email: str
+    subject: str
+    incoming_id: int | None
+    in_reply_to: str | None
+    references: list[str] = field(default_factory=list)
+    quote_header: str = ""
+    quote_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -303,6 +327,166 @@ class AppService:
             {"campaign_id": campaign_id, "sent": sent, "failed": failed, "unknown": unknown,
              "skipped_excluded": skipped},
         )
+
+    def prepare_reply(self, *, recipient_id: int | None = None,
+                      incoming_id: int | None = None) -> ReplyDraft:
+        """Готовит ответ на письмо поставщика или, если ответов не было, на наше письмо."""
+        incoming = None
+        if incoming_id is not None:
+            incoming = self.db.get_incoming(incoming_id)
+            if incoming is None:
+                raise ValueError("Письмо не найдено")
+            if not incoming["recipient_id"]:
+                raise ValueError("Письмо не привязано к поставщику. Сначала привяжите его вручную.")
+            recipient_id = int(incoming["recipient_id"])
+        if recipient_id is None:
+            raise ValueError("Не выбран поставщик")
+        recipient = self.db.get_recipient(recipient_id)
+        if recipient is None:
+            raise ValueError("Поставщик рассылки не найден")
+        campaign = self.db.get_campaign(int(recipient["campaign_id"]))
+        assert campaign is not None
+        if incoming is None:
+            incoming = self.db.latest_incoming_for_recipient(recipient_id)
+
+        if incoming is not None:
+            original = self._read_raw_message(incoming["raw_eml_path"])
+            to_email = (reply_address(original) if original is not None else "") or \
+                incoming["sender_email"]
+            references = (message_reference_ids(original) if original is not None else
+                          [normalize_message_id(incoming["in_reply_to"])])
+            parent = incoming["message_id"] or None
+            subject = incoming["subject"] or campaign["subject"]
+            received = self._display_time(incoming["received_at"] or incoming["created_at"])
+            quote_header = f"{received}, {incoming['sender_email']} писал(а):"
+            quote_text = incoming["body_text"] or ""
+        else:
+            outgoing = self.db.latest_outgoing_for_recipient(recipient_id)
+            if outgoing is None:
+                raise ValueError("Этому поставщику ещё ничего не отправлялось")
+            to_email = recipient["email"]
+            references = []
+            parent = outgoing["message_id"]
+            subject = outgoing["subject"]
+            quote_header = f"{self._display_time(outgoing['sent_at'])}, наше письмо:"
+            quote_text = outgoing["body"] or campaign["body"]
+        if parent:
+            references.append(parent)
+        references = list(dict.fromkeys(value for value in references if value))[-MAX_REFERENCES:]
+        if not REPLY_PREFIX_RE.match(subject):
+            subject = "Re: " + subject
+        return ReplyDraft(
+            campaign_id=int(campaign["id"]),
+            campaign_code=campaign["code"],
+            recipient_id=recipient_id,
+            supplier_name=recipient["supplier_name"],
+            to_email=to_email,
+            subject=self._subject_with_code(subject, campaign["code"]),
+            incoming_id=int(incoming["id"]) if incoming is not None else None,
+            in_reply_to=parent,
+            references=references,
+            quote_header=quote_header,
+            quote_text=quote_text,
+        )
+
+    def send_reply(self, draft: ReplyDraft, *, body: str, subject: str | None = None,
+                   attachment_paths: Iterable[str] = (), quote: bool = True) -> OperationResult:
+        body = body.strip()
+        if not body:
+            raise ValueError("Напишите текст ответа")
+        subject = self._subject_with_code((subject or draft.subject).strip() or draft.subject,
+                                          draft.campaign_code)
+        sources = [Path(value) for value in attachment_paths]
+        for path in sources:
+            if not path.is_file():
+                raise ValueError(f"Файл не найден: {path}")
+        if sum(path.stat().st_size for path in sources) > MAX_REPLY_ATTACHMENTS_BYTES:
+            raise ValueError("Вложения больше 20 МБ — почтовый сервер может их не принять")
+        if quote and draft.quote_text.strip():
+            quoted = draft.quote_text.strip()[:MAX_QUOTED_CHARS]
+            body += "\n\n" + draft.quote_header + "\n" + "\n".join(
+                "> " + line for line in quoted.splitlines()
+            )
+        # Проверяем настройки почты до копирования файлов.
+        settings = self.mail_settings()
+
+        campaign_root = self.paths.campaigns / draft.campaign_code / "outgoing"
+        copies = []
+        for source in sources:
+            destination = unique_path(campaign_root / "replies", source.name)
+            shutil.copy2(source, destination)
+            copies.append(destination)
+
+        with self._mail_lock:
+            gateway = MailGateway(settings)
+            message = gateway.build_message(
+                recipient=draft.to_email,
+                subject=subject,
+                body=body,
+                campaign_code=draft.campaign_code,
+                attachment_paths=copies,
+                in_reply_to=draft.in_reply_to,
+                references=draft.references,
+            )
+            raw_path = unique_path(
+                campaign_root / "messages",
+                f"reply-{draft.recipient_id}_{safe_name(draft.to_email, 'recipient')}.eml",
+            )
+            raw_path.write_bytes(message.as_bytes())
+            message_id = normalize_message_id(message["Message-ID"])
+            with gateway.smtp_session() as smtp:
+                self.db.record_reply_attempt(
+                    campaign_id=draft.campaign_id,
+                    recipient_id=draft.recipient_id,
+                    message_id=message_id,
+                    subject=subject,
+                    raw_eml_path=str(raw_path),
+                    to_email=draft.to_email,
+                    body=body,
+                    attachments=[str(path) for path in copies],
+                    incoming_id=draft.incoming_id,
+                )
+                try:
+                    smtp.send_message(message)
+                except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused,
+                        smtplib.SMTPDataError) as exc:
+                    self.db.set_reply_delivery(message_id, "failed")
+                    raise RuntimeError(f"Почтовый сервер отклонил ответ: {exc}") from exc
+                except Exception as exc:
+                    self.db.set_reply_delivery(message_id, "unknown")
+                    raise RuntimeError(
+                        "Не удалось подтвердить отправку ответа. Проверьте папку «Отправленные» "
+                        f"в почте, прежде чем отправлять повторно. ({exc})"
+                    ) from exc
+            self.db.set_reply_delivery(message_id, "sent")
+        return OperationResult(
+            f"Ответ отправлен: {draft.supplier_name} <{draft.to_email}>",
+            {"campaign_id": draft.campaign_id, "recipient_id": draft.recipient_id},
+        )
+
+    @staticmethod
+    def _subject_with_code(subject: str, code: str) -> str:
+        return subject if code.lower() in subject.lower() else f"{subject} [{code}]"
+
+    @staticmethod
+    def _read_raw_message(path: str | None) -> Message | None:
+        try:
+            return BytesParser(policy=policy.default).parsebytes(Path(path).read_bytes()) \
+                if path else None
+        except OSError:
+            return None
+
+    @staticmethod
+    def _display_time(value: str | None) -> str:
+        if not value:
+            return ""
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+        if parsed.tzinfo:
+            parsed = parsed.astimezone()
+        return parsed.strftime("%d.%m.%Y %H:%M")
 
     def check_mail(self, trigger_name: str = "manual") -> OperationResult:
         if not self._mail_lock.acquire(blocking=False):

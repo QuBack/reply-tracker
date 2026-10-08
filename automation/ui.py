@@ -8,14 +8,14 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from typing import Callable, Iterable
 
 from .database import Database
 from .mail_gateway import MAIL_PROVIDERS
-from .service import AppService, OperationResult
+from .service import AppService, OperationResult, ReplyDraft
 from .supplier_search import (SearchCancelled, clean_categories, clean_phones,
                               export_candidates_xlsx, normalize_email, normalize_web_url,
                               run_codex_search)
@@ -110,6 +110,15 @@ def text_matches(query: str, *fields: str) -> bool:
     words = query.casefold().split()
     haystack = " ".join(str(field or "") for field in fields).casefold()
     return all(word in haystack for word in words)
+
+
+def timestamp_key(value: str | None) -> datetime:
+    """Время для сравнения: письма приходят с разными часовыми поясами или без них."""
+    try:
+        parsed = datetime.fromisoformat(value or "")
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.astimezone()
 
 
 def display_datetime(value: str | None, *, with_time: bool = True) -> str:
@@ -841,8 +850,12 @@ class AutomationApp(tk.Tk):
         })
         self.recipients_tree.configure(height=6)
         self.recipients_tree.pack(fill="both", expand=True)
-        recipient_actions = ttk.Menubutton(recipients, text="Изменить состояние адресата")
-        recipient_actions.pack(anchor="w", pady=(8, 0))
+        recipient_buttons = ttk.Frame(recipients)
+        recipient_buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(recipient_buttons, text="Написать поставщику",
+                   command=self._write_to_selected_recipient).pack(side="left")
+        recipient_actions = ttk.Menubutton(recipient_buttons, text="Изменить состояние адресата")
+        recipient_actions.pack(side="left", padx=6)
         recipient_menu = tk.Menu(recipient_actions, tearoff=False)
         for label, status in (("Закрыть без ответа", "closed_no_response"),
                               ("Отказ поставщика", "declined"),
@@ -852,7 +865,7 @@ class AutomationApp(tk.Tk):
             )
         recipient_actions["menu"] = recipient_menu
 
-        responses = ttk.LabelFrame(right, text="Ответы по этой рассылке", padding=8)
+        responses = ttk.LabelFrame(right, text="Переписка по этой рассылке", padding=8)
         responses.pack(fill="both", expand=True)
         self.campaign_inbox_tree = self._make_tree(
             responses,
@@ -861,10 +874,16 @@ class AutomationApp(tk.Tk):
         )
         self.campaign_inbox_tree.configure(height=7)
         self.campaign_inbox_tree.pack(fill="both", expand=True)
+        self.campaign_inbox_tree.tag_configure("ours", foreground="#2F5D8A")
+        self.campaign_inbox_tree.tag_configure("failed", foreground="#9A3A3A")
         self.campaign_inbox_tree.bind("<Double-1>", self._open_campaign_response)
-        ttk.Button(responses, text="Открыть ответ", command=self._open_campaign_response).pack(
-            anchor="w", pady=(8, 0)
+        response_buttons = ttk.Frame(responses)
+        response_buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(response_buttons, text="Открыть", command=self._open_campaign_response).pack(
+            side="left"
         )
+        ttk.Button(response_buttons, text="Ответить",
+                   command=self._reply_to_selected_response).pack(side="left", padx=6)
 
     def _build_inbox_tab(self) -> None:
         self.inbox_tab.columnconfigure(0, weight=1)
@@ -903,7 +922,10 @@ class AutomationApp(tk.Tk):
         self.inbox_tree.bind("<<TreeviewSelect>>", self._on_incoming_selected)
         actions = ttk.Frame(self.inbox_tab)
         actions.grid(row=2, column=0, sticky="ew", pady=8)
-        ttk.Button(actions, text="Привязать вручную", command=self._open_assign_dialog).pack(side="left")
+        ttk.Button(actions, text="Ответить", command=self._reply_to_inbox_message).pack(side="left")
+        ttk.Button(actions, text="Привязать вручную", command=self._open_assign_dialog).pack(
+            side="left", padx=(6, 0)
+        )
         ttk.Button(actions, text="Открыть папку с файлами", command=self._open_incoming_folder).pack(
             side="left", padx=6
         )
@@ -1851,7 +1873,7 @@ class AutomationApp(tk.Tk):
             state="normal" if campaign["status"] in ("ready", "closed") else "disabled"
         )
         self._load_recipients(campaign_id, recipients)
-        self._load_campaign_responses(replies)
+        self._load_campaign_responses(campaign_id, replies)
 
     def _load_recipients(self, campaign_id: int, recipients: list[sqlite3.Row] | None = None) -> None:
         self.recipients_tree.delete(*self.recipients_tree.get_children())
@@ -1872,18 +1894,201 @@ class AutomationApp(tk.Tk):
             )
         self._apply_tree_sort(self.recipients_tree)
 
-    def _load_campaign_responses(self, replies: list[sqlite3.Row]) -> None:
-        self.campaign_inbox_tree.delete(*self.campaign_inbox_tree.get_children())
+    def _load_campaign_responses(self, campaign_id: int, replies: list[sqlite3.Row]) -> None:
+        tree = self.campaign_inbox_tree
+        tree.delete(*tree.get_children())
+        # Письма поставщиков и наши ответы — одна лента, новые сверху.
+        entries: list[tuple[datetime, str, tuple, tuple[str, ...]]] = []
         for row in replies:
-            self.campaign_inbox_tree.insert(
-                "", "end", iid=str(row["id"]),
-                values=(display_datetime(row["received_at"] or row["created_at"]),
-                        row["sender_email"], row["subject"], row["attachment_count"] or 0),
+            when = row["received_at"] or row["created_at"]
+            entries.append((timestamp_key(when), str(row["id"]), (
+                display_datetime(when), row["sender_email"], row["subject"],
+                row["attachment_count"] or 0,
+            ), ()))
+        for row in self.db.list_sent_replies(campaign_id):
+            failed = row["delivery_status"] == "failed"
+            subject = ("⚠ не отправлено: " if failed else "") + row["subject"]
+            entries.append((timestamp_key(row["sent_at"]), f"out-{row['id']}", (
+                display_datetime(row["sent_at"]), f"Мы → {row['to_email']}", subject,
+                len(json.loads(row["attachments_json"])),
+            ), ("failed",) if failed else ("ours",)))
+        entries.sort(key=lambda entry: entry[0], reverse=True)
+        for _when, iid, values, tags in entries:
+            tree.insert("", "end", iid=iid, values=values, tags=tags)
+
+    def _selected_response(self) -> tuple[str, int] | None:
+        """Выбранная строка переписки: ("in", id письма) или ("out", id нашего ответа)."""
+        selection = self.campaign_inbox_tree.selection()
+        if not selection:
+            return None
+        iid = selection[0]
+        if iid.startswith("out-"):
+            return "out", int(iid[4:])
+        return "in", int(iid)
+
+    def _reply_to_selected_response(self) -> None:
+        selected = self._selected_response()
+        if selected is None:
+            self.status_var.set("Выберите письмо в переписке")
+            return
+        kind, item_id = selected
+        if kind == "in":
+            self._open_reply_dialog(incoming_id=item_id)
+            return
+        outgoing = self.db.get_outgoing(item_id)
+        if outgoing is not None:
+            self._open_reply_dialog(recipient_id=int(outgoing["recipient_id"]))
+
+    def _write_to_selected_recipient(self) -> None:
+        recipient_id = self._selected_tree_id(self.recipients_tree)
+        if recipient_id is None:
+            self.status_var.set("Выберите поставщика в списке")
+            return
+        self._open_reply_dialog(recipient_id=recipient_id)
+
+    def _reply_to_inbox_message(self) -> None:
+        incoming_id = self._selected_tree_id(self.inbox_tree)
+        if incoming_id is None:
+            self.status_var.set("Выберите письмо")
+            return
+        self._open_reply_dialog(incoming_id=incoming_id)
+
+    def _open_reply_dialog(self, *, recipient_id: int | None = None,
+                           incoming_id: int | None = None) -> None:
+        try:
+            draft = self.service.prepare_reply(recipient_id=recipient_id, incoming_id=incoming_id)
+        except ValueError as exc:
+            messagebox.showwarning("Ответ", str(exc), parent=self)
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title(f"Ответ: {draft.supplier_name}")
+        dialog.geometry("780x660")
+        dialog.minsize(620, 520)
+        dialog.transient(self)
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(5, weight=1)
+        ttk.Label(frame, text=draft.supplier_name, style="Header.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(frame, text=f"Кому: {draft.to_email}", style="Muted.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(2, 10)
+        )
+        ttk.Label(frame, text="Тема").grid(row=2, column=0, sticky="w")
+        subject_var = tk.StringVar(value=draft.subject)
+        ttk.Entry(frame, textvariable=subject_var).grid(row=3, column=0, sticky="ew", pady=(2, 8))
+        ttk.Label(frame, text="Текст").grid(row=4, column=0, sticky="w")
+        body = scrolledtext.ScrolledText(frame, wrap="word", height=12, font=("Segoe UI", 10))
+        body.grid(row=5, column=0, sticky="nsew", pady=(2, 6))
+        quote_var = tk.BooleanVar(value=True)
+        quote_label = ("Добавить цитату письма поставщика" if draft.incoming_id is not None
+                       else "Добавить цитату нашего письма")
+        ttk.Checkbutton(frame, text=quote_label, variable=quote_var).grid(
+            row=6, column=0, sticky="w", pady=(0, 8)
+        )
+        files_header = ttk.Frame(frame)
+        files_header.grid(row=7, column=0, sticky="ew")
+        ttk.Label(files_header, text="Вложения").pack(side="left")
+        files = tk.Listbox(frame, height=4, font=("Segoe UI", 9), borderwidth=1, relief="solid")
+        files.grid(row=8, column=0, sticky="ew", pady=(2, 10))
+        paths: list[str] = []
+
+        def add_files() -> None:
+            for selected in filedialog.askopenfilenames(title="Вложения к ответу", parent=dialog):
+                if selected not in paths:
+                    paths.append(selected)
+                    files.insert("end", Path(selected).name)
+
+        def remove_file() -> None:
+            for index in reversed(files.curselection()):
+                files.delete(index)
+                del paths[index]
+
+        ttk.Button(files_header, text="Добавить файлы", command=add_files).pack(
+            side="left", padx=(10, 0)
+        )
+        ttk.Button(files_header, text="Убрать", command=remove_file).pack(side="left", padx=6)
+
+        def sent(_result: OperationResult) -> None:
+            if dialog.winfo_exists():
+                dialog.destroy()
+            self._on_campaign_selected()
+
+        def send() -> None:
+            if self._background_busy:
+                messagebox.showinfo("Ответ", "Дождитесь завершения текущей операции.",
+                                    parent=dialog)
+                return
+            text = body.get("1.0", "end").strip()
+            if not text:
+                messagebox.showwarning("Ответ", "Напишите текст ответа.", parent=dialog)
+                return
+            parameters = {
+                "body": text,
+                "subject": subject_var.get(),
+                "attachment_paths": list(paths),
+                "quote": quote_var.get(),
+            }
+            self._run_background(
+                "Отправка ответа…",
+                lambda: self.service.send_reply(draft, **parameters),
+                on_success=sent,
+                notify=True,
             )
 
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=9, column=0, sticky="e")
+        ttk.Button(buttons, text="Отмена", command=dialog.destroy).pack(side="right")
+        ttk.Button(buttons, text="Отправить", command=send).pack(side="right", padx=6)
+        body.focus_set()
+
+    def _open_sent_reply(self, outgoing_id: int) -> None:
+        reply = self.db.get_outgoing(outgoing_id)
+        if reply is None:
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Наш ответ")
+        dialog.geometry("820x560")
+        dialog.transient(self)
+        ttk.Label(dialog, text=reply["subject"], style="Header.TLabel").pack(
+            anchor="w", padx=16, pady=(14, 3)
+        )
+        state = {"sent": "отправлено", "failed": "не отправлено",
+                 "unknown": "исход отправки неизвестен"}.get(reply["delivery_status"], "")
+        ttk.Label(dialog, text=f"Кому: {reply['to_email']}  •  "
+                  f"{display_datetime(reply['sent_at'])}  •  {state}").pack(
+            anchor="w", padx=16, pady=(0, 12)
+        )
+        text = scrolledtext.ScrolledText(dialog, wrap="word", height=14, font=("Segoe UI", 10))
+        text.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+        text.insert("1.0", reply["body"])
+        text.configure(state="disabled")
+        attachments = [Path(value) for value in json.loads(reply["attachments_json"])]
+        if attachments:
+            ttk.Label(dialog, text="Вложения — двойной щелчок открывает файл").pack(
+                anchor="w", padx=16
+            )
+            files = tk.Listbox(dialog, height=min(len(attachments), 5), font=("Segoe UI", 9))
+            files.pack(fill="x", padx=16, pady=(4, 10))
+            for path in attachments:
+                files.insert("end", path.name)
+            files.bind("<Double-1>", lambda _evt: self._open_path(attachments[files.curselection()[0]])
+                       if files.curselection() else None)
+        actions = ttk.Frame(dialog)
+        actions.pack(fill="x", padx=16, pady=(0, 14))
+        ttk.Button(actions, text="Закрыть", command=dialog.destroy).pack(side="right")
+        ttk.Button(actions, text="Написать ещё", command=lambda: (
+            dialog.destroy(), self._open_reply_dialog(recipient_id=int(reply["recipient_id"]))
+        )).pack(side="right", padx=6)
+
     def _open_campaign_response(self, _event: tk.Event | None = None) -> None:
-        incoming_id = self._selected_tree_id(self.campaign_inbox_tree)
-        if incoming_id is None:
+        selected = self._selected_response()
+        if selected is None:
+            return
+        kind, incoming_id = selected
+        if kind == "out":
+            self._open_sent_reply(incoming_id)
             return
         message = self.db.get_incoming(incoming_id)
         if message is None:
@@ -1916,9 +2121,12 @@ class AutomationApp(tk.Tk):
                                  "PDF/Excel" if attachment["is_allowed"] else "Другой"))
         files.bind("<Double-1>", lambda _evt: self._open_path(paths[files.selection()[0]])
                    if files.selection() else None)
-        ttk.Button(dialog, text="Закрыть", command=dialog.destroy).pack(
-            anchor="e", padx=16, pady=(0, 14)
-        )
+        actions = ttk.Frame(dialog)
+        actions.pack(fill="x", padx=16, pady=(0, 14))
+        ttk.Button(actions, text="Закрыть", command=dialog.destroy).pack(side="right")
+        ttk.Button(actions, text="Ответить", command=lambda: (
+            dialog.destroy(), self._open_reply_dialog(incoming_id=incoming_id)
+        )).pack(side="right", padx=6)
 
     def _retry_campaign(self) -> None:
         campaign_id = self._selected_tree_id(self.campaigns_tree)

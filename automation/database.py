@@ -127,7 +127,12 @@ CREATE TABLE IF NOT EXISTS outgoing_messages (
     subject TEXT NOT NULL,
     sent_at TEXT NOT NULL,
     raw_eml_path TEXT NOT NULL,
-    delivery_status TEXT NOT NULL DEFAULT 'sent'
+    delivery_status TEXT NOT NULL DEFAULT 'sent',
+    kind TEXT NOT NULL DEFAULT 'campaign',
+    to_email TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    reply_to_incoming_id INTEGER REFERENCES incoming_messages(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS incoming_messages (
@@ -290,11 +295,21 @@ class Database:
             outgoing_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(outgoing_messages)")
             }
-            if "delivery_status" not in outgoing_columns:
-                connection.execute(
-                    "ALTER TABLE outgoing_messages "
-                    "ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'sent'"
-                )
+            for column, definition in (
+                ("delivery_status", "TEXT NOT NULL DEFAULT 'sent'"),
+                # Ответы поставщикам внутри рассылки хранятся рядом с письмами рассылки,
+                # чтобы следующий ответ поставщика привязывался по заголовкам цепочки.
+                ("kind", "TEXT NOT NULL DEFAULT 'campaign'"),
+                ("to_email", "TEXT NOT NULL DEFAULT ''"),
+                ("body", "TEXT NOT NULL DEFAULT ''"),
+                ("attachments_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("reply_to_incoming_id",
+                 "INTEGER REFERENCES incoming_messages(id) ON DELETE SET NULL"),
+            ):
+                if column not in outgoing_columns:
+                    connection.execute(
+                        f"ALTER TABLE outgoing_messages ADD COLUMN {column} {definition}"
+                    )
             connection.execute("PRAGMA user_version = 3")
 
     def _migrate_suppliers_optional_email(self, connection: sqlite3.Connection) -> None:
@@ -896,6 +911,74 @@ class Database:
                 JOIN campaigns c ON c.id = r.campaign_id
                 WHERE r.id = ?
                 """,
+                (recipient_id,),
+            ).fetchone()
+
+    def record_reply_attempt(
+        self, *, campaign_id: int, recipient_id: int, message_id: str, subject: str,
+        raw_eml_path: str, to_email: str, body: str, attachments: Iterable[str],
+        incoming_id: int | None,
+    ) -> int:
+        """Записывает ответ поставщику до отправки; состояние адресата не меняется."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO outgoing_messages(campaign_id, recipient_id, message_id, subject, "
+                "sent_at, raw_eml_path, delivery_status, kind, to_email, body, "
+                "attachments_json, reply_to_incoming_id) "
+                "VALUES(?, ?, ?, ?, ?, ?, 'unknown', 'reply', ?, ?, ?, ?)",
+                (campaign_id, recipient_id, message_id.lower(), subject, utc_now(), raw_eml_path,
+                 to_email, body, json.dumps(list(attachments), ensure_ascii=False), incoming_id),
+            )
+        return int(cursor.lastrowid)
+
+    def set_reply_delivery(self, message_id: str, status: str) -> None:
+        if status not in ("sent", "failed", "unknown"):
+            raise ValueError("Недопустимое состояние отправки")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id, campaign_id, recipient_id, to_email FROM outgoing_messages "
+                "WHERE message_id = ? COLLATE NOCASE AND kind = 'reply'", (message_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Ответ не найден")
+            connection.execute(
+                "UPDATE outgoing_messages SET delivery_status = ?, "
+                "sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END WHERE id = ?",
+                (status, status, utc_now(), row["id"]),
+            )
+        self.log("info" if status == "sent" else "warning", f"reply_{status}",
+                 int(row["campaign_id"]),
+                 {"recipient_id": row["recipient_id"], "to": row["to_email"]})
+
+    def list_sent_replies(self, campaign_id: int) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return list(connection.execute(
+                "SELECT o.*, s.name AS supplier_name FROM outgoing_messages o "
+                "JOIN campaign_recipients r ON r.id = o.recipient_id "
+                "JOIN suppliers s ON s.id = r.supplier_id "
+                "WHERE o.campaign_id = ? AND o.kind = 'reply' ORDER BY o.id",
+                (campaign_id,),
+            ))
+
+    def get_outgoing(self, outgoing_id: int) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT * FROM outgoing_messages WHERE id = ?", (outgoing_id,)
+            ).fetchone()
+
+    def latest_incoming_for_recipient(self, recipient_id: int) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT * FROM incoming_messages WHERE recipient_id = ? "
+                "ORDER BY COALESCE(received_at, created_at) DESC, id DESC LIMIT 1",
+                (recipient_id,),
+            ).fetchone()
+
+    def latest_outgoing_for_recipient(self, recipient_id: int) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT * FROM outgoing_messages WHERE recipient_id = ? "
+                "AND delivery_status != 'failed' ORDER BY id DESC LIMIT 1",
                 (recipient_id,),
             ).fetchone()
 
