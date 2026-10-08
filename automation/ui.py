@@ -110,14 +110,14 @@ def text_matches(query: str, *fields: str) -> bool:
     return all(word in haystack for word in words)
 
 
-def display_datetime(value: str | None) -> str:
+def display_datetime(value: str | None, *, with_time: bool = True) -> str:
     if not value:
         return "—"
     try:
         parsed = datetime.fromisoformat(value)
         if parsed.tzinfo:
             parsed = parsed.astimezone()
-        return parsed.strftime("%d.%m.%Y %H:%M")
+        return parsed.strftime("%d.%m.%Y %H:%M" if with_time else "%d.%m.%Y")
     except ValueError:
         return value
 
@@ -140,6 +140,9 @@ class AutomationApp(tk.Tk):
         self._campaign_supplier_ids: list[int] = []
         self._supplier_rows: dict[int, sqlite3.Row] = {}
         self._candidate_rows: dict[int, sqlite3.Row] = {}
+        # Сортировка таблиц по щелчку на заголовке: имя таблицы -> (колонка, по убыванию).
+        self._tree_sort: dict[str, tuple[str, bool]] = {}
+        self._tree_sort_keys: dict[str, dict[str, Callable[[str], str]]] = {}
         self._campaign_attachment_paths: list[str] = []
         self._supplier_search_cancel = threading.Event()
         self._search_active = False
@@ -253,10 +256,16 @@ class AutomationApp(tk.Tk):
                 ("phone", "Телефон", 150),
                 ("categories", "Категории", 210),
                 ("excluded", "Рассылки", 110),
+                ("added", "Добавлен", 90),
                 ("notes", "Заметки", 220),
             ],
             selectmode="extended",
         )
+        self._enable_tree_sorting(self.suppliers_tree, {
+            "added": lambda iid: self._supplier_rows[int(iid)]["created_at"],
+        })
+        # По умолчанию — по названию: ORDER BY в SQLite путает регистр кириллицы.
+        self._tree_sort[str(self.suppliers_tree)] = ("name", False)
         self.suppliers_tree.tag_configure("excluded", foreground="#9A3A3A")
         self.suppliers_tree.grid(row=1, column=0, sticky="nsew")
         self.suppliers_tree.bind("<<TreeviewSelect>>", self._on_supplier_selected)
@@ -402,7 +411,11 @@ class AutomationApp(tk.Tk):
             ("email", "Email", 180),
             ("phone", "Телефон", 150),
             ("status", "Статус", 110),
+            ("found", "Найден", 90),
         ], selectmode="extended")
+        self._enable_tree_sorting(self.candidates_tree, {
+            "found": lambda iid: self._candidate_rows[int(iid)]["created_at"],
+        })
         self.candidates_tree.grid(row=1, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(left, orient="vertical", command=self.candidates_tree.yview)
         scrollbar.grid(row=1, column=1, sticky="ns")
@@ -894,6 +907,45 @@ class AutomationApp(tk.Tk):
             tree.column(key, width=width, minwidth=55, stretch=True)
         return tree
 
+    def _enable_tree_sorting(self, tree: ttk.Treeview,
+                             keys: dict[str, Callable[[str], str]] | None = None) -> None:
+        """Щелчок по заголовку сортирует таблицу, повторный — в обратном порядке.
+
+        keys задаёт значение для сортировки колонки, если показанный текст для неё
+        не годится (например, дата в формате ДД.ММ.ГГГГ).
+        """
+        self._tree_sort_keys[str(tree)] = keys or {}
+        for column in tree["columns"]:
+            tree.heading(column, command=lambda c=column: self._toggle_tree_sort(tree, c))
+
+    def _toggle_tree_sort(self, tree: ttk.Treeview, column: str) -> None:
+        current = self._tree_sort.get(str(tree))
+        descending = current == (column, False)
+        self._tree_sort[str(tree)] = (column, descending)
+        self._apply_tree_sort(tree)
+
+    def _apply_tree_sort(self, tree: ttk.Treeview) -> None:
+        state = self._tree_sort.get(str(tree))
+        if state is None:
+            return
+        column, descending = state
+        key = self._tree_sort_keys.get(str(tree), {}).get(column)
+        values = {
+            iid: (key(iid) if key else tree.set(iid, column).casefold()) or ""
+            for iid in tree.get_children()
+        }
+        # Пустые значения всегда внизу, в каком бы направлении ни сортировали.
+        filled = sorted((iid for iid in values if values[iid]),
+                        key=values.__getitem__, reverse=descending)
+        empty = [iid for iid in values if not values[iid]]
+        for index, iid in enumerate(filled + empty):
+            tree.move(iid, "", index)
+        for name in tree["columns"]:
+            title = tree.heading(name, "text").rstrip(" ▲▼")
+            if name == column:
+                title += " ▼" if descending else " ▲"
+            tree.heading(name, text=title)
+
     def refresh_all(self) -> None:
         self.refresh_dashboard()
         self.refresh_suppliers()
@@ -950,7 +1002,8 @@ class AutomationApp(tk.Tk):
                 self.suppliers_tree.insert(
                     "", "end", iid=iid,
                     values=(row["name"], row["email"] or "", phones_summary(phones),
-                            row["categories"], mailing, row["notes"]),
+                            row["categories"], mailing,
+                            display_datetime(row["created_at"], with_time=False), row["notes"]),
                     tags=("excluded",) if row["excluded"] else (),
                 )
             if row["excluded"] or not row["email"]:
@@ -958,6 +1011,7 @@ class AutomationApp(tk.Tk):
             self._campaign_supplier_ids.append(int(row["id"]))
             if compose_list is not None:
                 compose_list.insert("end", f"{row['name']}  <{row['email']}>")
+        self._apply_tree_sort(self.suppliers_tree)
         visible = [iid for iid in selected if self.suppliers_tree.exists(iid)]
         if visible:
             self.suppliers_tree.selection_set(visible)
@@ -1240,10 +1294,11 @@ class AutomationApp(tk.Tk):
             self.candidates_tree.insert(
                 "", "end", iid=str(candidate_id), values=(
                     row["name"], ", ".join(categories), row["region"], row["email"],
-                    phones_summary(phones),
-                    status,
+                    phones_summary(phones), status,
+                    display_datetime(row["created_at"], with_time=False),
                 )
             )
+        self._apply_tree_sort(self.candidates_tree)
         visible = [iid for iid in selected if self.candidates_tree.exists(iid)]
         if visible:
             self.candidates_tree.selection_set(visible)
