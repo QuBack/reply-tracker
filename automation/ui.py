@@ -11,7 +11,7 @@ import webbrowser
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
-from typing import Callable
+from typing import Callable, Iterable
 
 from .database import Database
 from .mail_gateway import MAIL_PROVIDERS
@@ -48,6 +48,8 @@ CANDIDATE_STATUS_LABELS = {
 ALL_CATEGORIES = "Все категории"
 ALL_STATUSES = "Все статусы"
 ANY_CONTACTS = "Любые контакты"
+CHECK_COLUMN = "check"
+CHECKED, UNCHECKED = "☑", "☐"
 
 # Коды клавиш Windows (VK_*) для сочетаний с Ctrl в любой раскладке.
 CONTROL_KEYCODE_EVENTS = {
@@ -143,6 +145,8 @@ class AutomationApp(tk.Tk):
         # Сортировка таблиц по щелчку на заголовке: имя таблицы -> (колонка, по убыванию).
         self._tree_sort: dict[str, tuple[str, bool]] = {}
         self._tree_sort_keys: dict[str, dict[str, Callable[[str], str]]] = {}
+        self._compose_checked: set[int] = set()
+        self._recipient_rows: dict[int, sqlite3.Row] = {}
         self._campaign_attachment_paths: list[str] = []
         self._supplier_search_cancel = threading.Event()
         self._search_active = False
@@ -259,8 +263,9 @@ class AutomationApp(tk.Tk):
                 ("added", "Добавлен", 90),
                 ("notes", "Заметки", 220),
             ],
-            selectmode="extended",
+            selectmode="extended", checkboxes=True,
         )
+        self._enable_checkboxes(self.suppliers_tree)
         self._enable_tree_sorting(self.suppliers_tree, {
             "added": lambda iid: self._supplier_rows[int(iid)]["created_at"],
         })
@@ -268,15 +273,18 @@ class AutomationApp(tk.Tk):
         self._tree_sort[str(self.suppliers_tree)] = ("name", False)
         self.suppliers_tree.tag_configure("excluded", foreground="#9A3A3A")
         self.suppliers_tree.grid(row=1, column=0, sticky="nsew")
-        self.suppliers_tree.bind("<<TreeviewSelect>>", self._on_supplier_selected)
+        self.suppliers_tree.bind("<<TreeviewSelect>>", self._on_supplier_selected, add="+")
         self._bind_select_all(self.suppliers_tree)
         bulk = ttk.Frame(left)
         bulk.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(bulk, text="Выделить все",
+        ttk.Button(bulk, text="Отметить все",
                    command=lambda: self._select_all(self.suppliers_tree)).pack(side="left")
-        supplier_actions = ttk.Menubutton(bulk, text="Действия с выбранными")
+        supplier_actions = ttk.Menubutton(bulk, text="Действия с отмеченными")
         supplier_actions.pack(side="left", padx=6)
         supplier_menu = tk.Menu(supplier_actions, tearoff=False)
+        supplier_menu.add_command(label="Создать рассылку для отмеченных…",
+                                  command=self._compose_for_selected_suppliers)
+        supplier_menu.add_separator()
         supplier_menu.add_command(label="Исключить из рассылок…",
                                   command=lambda: self._set_selected_suppliers_excluded(True))
         supplier_menu.add_command(label="Вернуть в рассылки",
@@ -412,7 +420,8 @@ class AutomationApp(tk.Tk):
             ("phone", "Телефон", 150),
             ("status", "Статус", 110),
             ("found", "Найден", 90),
-        ], selectmode="extended")
+        ], selectmode="extended", checkboxes=True)
+        self._enable_checkboxes(self.candidates_tree)
         self._enable_tree_sorting(self.candidates_tree, {
             "found": lambda iid: self._candidate_rows[int(iid)]["created_at"],
         })
@@ -420,14 +429,14 @@ class AutomationApp(tk.Tk):
         scrollbar = ttk.Scrollbar(left, orient="vertical", command=self.candidates_tree.yview)
         scrollbar.grid(row=1, column=1, sticky="ns")
         self.candidates_tree.configure(yscrollcommand=scrollbar.set)
-        self.candidates_tree.bind("<<TreeviewSelect>>", self._on_candidate_selected)
+        self.candidates_tree.bind("<<TreeviewSelect>>", self._on_candidate_selected, add="+")
         self._bind_select_all(self.candidates_tree)
 
         bulk = ttk.Frame(left)
         bulk.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Button(bulk, text="Выделить все",
+        ttk.Button(bulk, text="Отметить все",
                    command=lambda: self._select_all(self.candidates_tree)).pack(side="left")
-        candidate_actions = ttk.Menubutton(bulk, text="Действия с выбранными")
+        candidate_actions = ttk.Menubutton(bulk, text="Действия с отмеченными")
         candidate_actions.pack(side="left", padx=6)
         candidate_menu = tk.Menu(candidate_actions, tearoff=False)
         candidate_menu.add_command(label="Добавить в справочник",
@@ -447,7 +456,7 @@ class AutomationApp(tk.Tk):
                    command=lambda: self._export_search_candidates(only_selected=False)).pack(
             side="right"
         )
-        ttk.Button(bulk, text="Выгрузить выбранные",
+        ttk.Button(bulk, text="Выгрузить отмеченные",
                    command=lambda: self._export_search_candidates(only_selected=True)).pack(
             side="right", padx=6
         )
@@ -567,15 +576,53 @@ class AutomationApp(tk.Tk):
         side.rowconfigure(1, weight=2)
         side.rowconfigure(4, weight=1)
         ttk.Label(side, text="Получатели", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        self.compose_suppliers_list = tk.Listbox(
-            side,
-            selectmode="extended",
-            exportselection=False,
-            font=("Segoe UI", 9),
-            borderwidth=1,
-            relief="solid",
+        recipients = ttk.Frame(side)
+        recipients.grid(row=1, column=0, sticky="nsew", pady=(5, 12))
+        recipients.columnconfigure(0, weight=1)
+        recipients.rowconfigure(1, weight=1)
+        recipient_filters = ttk.Frame(recipients)
+        recipient_filters.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        recipient_filters.columnconfigure(0, weight=1)
+        self.compose_search_var = tk.StringVar()
+        ttk.Entry(recipient_filters, textvariable=self.compose_search_var).grid(
+            row=0, column=0, sticky="ew"
         )
-        self.compose_suppliers_list.grid(row=1, column=0, sticky="nsew", pady=(5, 12))
+        self.compose_category_var = tk.StringVar(value=ALL_CATEGORIES)
+        self.compose_category_box = ttk.Combobox(
+            recipient_filters, textvariable=self.compose_category_var, state="readonly", width=20
+        )
+        self.compose_category_box.grid(row=0, column=1, padx=(6, 0))
+        for variable in (self.compose_search_var, self.compose_category_var):
+            variable.trace_add("write", lambda *_args: self._fill_compose_recipients())
+        self.compose_recipients_tree = self._make_tree(recipients, [
+            ("name", "Поставщик", 170),
+            ("email", "Email", 150),
+            ("categories", "Категории", 130),
+            ("added", "Добавлен", 80),
+        ], selectmode="none", checkboxes=True)
+        self.compose_recipients_tree.grid(row=1, column=0, sticky="nsew")
+        recipient_scroll = ttk.Scrollbar(
+            recipients, orient="vertical", command=self.compose_recipients_tree.yview
+        )
+        recipient_scroll.grid(row=1, column=1, sticky="ns")
+        self.compose_recipients_tree.configure(yscrollcommand=recipient_scroll.set)
+        self.compose_recipients_tree.bind("<Button-1>", self._on_compose_recipient_click)
+        self.compose_recipients_tree.heading(
+            CHECK_COLUMN, command=self._toggle_all_compose_recipients
+        )
+        self._enable_tree_sorting(self.compose_recipients_tree, {
+            "added": lambda iid: self._supplier_rows[int(iid)]["created_at"],
+        })
+        self._tree_sort[str(self.compose_recipients_tree)] = ("name", False)
+        recipient_actions = ttk.Frame(recipients)
+        recipient_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(recipient_actions, text="Отметить показанных",
+                   command=lambda: self._set_compose_shown_checked(True)).pack(side="left")
+        ttk.Button(recipient_actions, text="Снять все",
+                   command=self._clear_compose_recipients).pack(side="left", padx=6)
+        self.compose_count_var = tk.StringVar()
+        ttk.Label(recipient_actions, textvariable=self.compose_count_var,
+                  style="Muted.TLabel").pack(side="right")
         ttk.Label(side, text="Дополнительные вложения", style="Section.TLabel").grid(row=2, column=0, sticky="w")
         attach_actions = ttk.Frame(side)
         attach_actions.grid(row=3, column=0, sticky="ew", pady=4)
@@ -590,14 +637,17 @@ class AutomationApp(tk.Tk):
             row=6, column=0, sticky="ew", pady=(8, 0)
         )
 
-    def _open_compose_dialog(self) -> None:
+    def _open_compose_dialog(self, preselected: Iterable[int] = ()) -> None:
         if self._compose_dialog is not None and self._compose_dialog.winfo_exists():
+            self._compose_checked.update(preselected)
+            self._fill_compose_recipients()
             self._compose_dialog.lift()
             return
+        self._compose_checked = set(preselected)
         dialog = tk.Toplevel(self)
         dialog.title("Новая рассылка")
-        dialog.geometry("1000x700")
-        dialog.minsize(850, 600)
+        dialog.geometry("1180x720")
+        dialog.minsize(950, 600)
         dialog.transient(self)
         dialog.protocol("WM_DELETE_WINDOW", self._close_compose_dialog)
         self._compose_dialog = dialog
@@ -615,7 +665,93 @@ class AutomationApp(tk.Tk):
         if self._compose_dialog is not None and self._compose_dialog.winfo_exists():
             self._compose_dialog.destroy()
         self._compose_dialog = None
+        self._compose_checked.clear()
         self._campaign_attachment_paths.clear()
+
+    def _compose_recipients_open(self) -> bool:
+        tree = getattr(self, "compose_recipients_tree", None)
+        return tree is not None and bool(tree.winfo_exists())
+
+    def _fill_compose_recipients(self) -> None:
+        if not self._compose_recipients_open():
+            return
+        tree = self.compose_recipients_tree
+        tree.delete(*tree.get_children())
+        eligible = [self._supplier_rows[value] for value in self._campaign_supplier_ids
+                    if value in self._supplier_rows]
+        categories = sorted({value.strip() for row in eligible
+                             for value in row["categories"].split(",") if value.strip()},
+                            key=str.casefold)
+        values = [ALL_CATEGORIES, *categories]
+        self.compose_category_box.configure(values=values)
+        if self.compose_category_var.get() not in values:
+            self.compose_category_var.set(ALL_CATEGORIES)
+        category = self.compose_category_var.get().casefold()
+        search = self.compose_search_var.get()
+        for row in eligible:
+            row_categories = [value.strip().casefold() for value in row["categories"].split(",")]
+            if category != ALL_CATEGORIES.casefold() and category not in row_categories:
+                continue
+            if not text_matches(search, row["name"], row["email"], row["categories"]):
+                continue
+            tree.insert("", "end", iid=str(row["id"]), values=(
+                row["name"], row["email"], row["categories"],
+                display_datetime(row["created_at"], with_time=False),
+            ))
+        self._apply_tree_sort(tree)
+        self._update_compose_checkmarks()
+
+    def _update_compose_checkmarks(self) -> None:
+        tree = self.compose_recipients_tree
+        shown = tree.get_children()
+        for iid in shown:
+            tree.set(iid, CHECK_COLUMN, CHECKED if int(iid) in self._compose_checked else UNCHECKED)
+        all_checked = bool(shown) and all(int(iid) in self._compose_checked for iid in shown)
+        tree.heading(CHECK_COLUMN, text=CHECKED if all_checked else UNCHECKED)
+        chosen = len(self._compose_checked & set(self._campaign_supplier_ids))
+        self.compose_count_var.set(f"Отмечено {chosen}, показано {len(shown)}")
+
+    def _on_compose_recipient_click(self, event: tk.Event) -> str | None:
+        tree = self.compose_recipients_tree
+        iid = tree.identify_row(event.y)
+        if tree.identify_region(event.x, event.y) != "cell" or not iid:
+            return None
+        self._compose_checked ^= {int(iid)}
+        self._update_compose_checkmarks()
+        return "break"
+
+    def _set_compose_shown_checked(self, checked: bool) -> None:
+        shown = {int(iid) for iid in self.compose_recipients_tree.get_children()}
+        if checked:
+            self._compose_checked |= shown
+        else:
+            self._compose_checked -= shown
+        self._update_compose_checkmarks()
+
+    def _toggle_all_compose_recipients(self) -> None:
+        shown = {int(iid) for iid in self.compose_recipients_tree.get_children()}
+        self._set_compose_shown_checked(not shown <= self._compose_checked)
+
+    def _clear_compose_recipients(self) -> None:
+        self._compose_checked.clear()
+        self._update_compose_checkmarks()
+
+    def _compose_for_selected_suppliers(self) -> None:
+        supplier_ids = self._selected_ids(self.suppliers_tree)
+        if not supplier_ids:
+            self.status_var.set("Отметьте поставщиков в таблице")
+            return
+        eligible = [value for value in supplier_ids if value in self._campaign_supplier_ids]
+        skipped = len(supplier_ids) - len(eligible)
+        if not eligible:
+            messagebox.showwarning(
+                "Рассылка", "У отмеченных поставщиков нет email или они исключены из рассылок.",
+                parent=self,
+            )
+            return
+        self._open_compose_dialog(eligible)
+        if skipped:
+            self.status_var.set(f"Пропущено без email или исключённых из рассылок: {skipped}")
 
     def _choose_request_file(self) -> None:
         selected = filedialog.askopenfilename(
@@ -661,6 +797,7 @@ class AutomationApp(tk.Tk):
                 ("status", "Состояние", 125),
             ],
         )
+        self._enable_tree_sorting(self.campaigns_tree)
         self.campaigns_tree.pack(fill="both", expand=True)
         self.campaigns_tree.bind("<<TreeviewSelect>>", self._on_campaign_selected)
 
@@ -698,6 +835,10 @@ class AutomationApp(tk.Tk):
                 ("response", "Последний ответ", 145),
             ],
         )
+        self._enable_tree_sorting(self.recipients_tree, {
+            "files": lambda iid: f"{self._recipient_rows[int(iid)]['file_count']:09d}",
+            "response": lambda iid: self._recipient_rows[int(iid)]["last_response_at"] or "",
+        })
         self.recipients_tree.configure(height=6)
         self.recipients_tree.pack(fill="both", expand=True)
         recipient_actions = ttk.Menubutton(recipients, text="Изменить состояние адресата")
@@ -899,13 +1040,58 @@ class AutomationApp(tk.Tk):
 
     @staticmethod
     def _make_tree(parent: tk.Misc, columns: list[tuple[str, str, int]],
-                   selectmode: str = "browse") -> ttk.Treeview:
+                   selectmode: str = "browse", checkboxes: bool = False) -> ttk.Treeview:
         keys = [item[0] for item in columns]
-        tree = ttk.Treeview(parent, columns=keys, show="headings", selectmode=selectmode)
+        # Колонка галочек стоит последней в values (вставки не меняются),
+        # но показывается первой.
+        tree = ttk.Treeview(
+            parent, columns=keys + [CHECK_COLUMN] if checkboxes else keys,
+            displaycolumns=[CHECK_COLUMN] + keys if checkboxes else keys,
+            show="headings", selectmode=selectmode,
+        )
         for key, title, width in columns:
             tree.heading(key, text=title)
             tree.column(key, width=width, minwidth=55, stretch=True)
+        if checkboxes:
+            tree.heading(CHECK_COLUMN, text=UNCHECKED)
+            tree.column(CHECK_COLUMN, width=32, minwidth=32, stretch=False, anchor="center")
         return tree
+
+    def _enable_checkboxes(self, tree: ttk.Treeview) -> None:
+        """Галочки отражают выделение таблицы: щелчок по ним отмечает строку без Ctrl."""
+        tree.bind("<Button-1>", lambda event: self._on_checkbox_click(tree, event), add="+")
+        tree.bind("<<TreeviewSelect>>", lambda _event: self._sync_checkmarks(tree), add="+")
+        tree.heading(CHECK_COLUMN, command=lambda: self._toggle_all_checked(tree))
+
+    @staticmethod
+    def _on_checkbox_click(tree: ttk.Treeview, event: tk.Event) -> str | None:
+        iid = tree.identify_row(event.y)
+        if (tree.identify_region(event.x, event.y) != "cell" or not iid or
+                tree.identify_column(event.x) != "#1"):
+            return None
+        if iid in tree.selection():
+            tree.selection_remove(iid)
+        else:
+            tree.selection_add(iid)
+        tree.focus(iid)
+        return "break"
+
+    @staticmethod
+    def _sync_checkmarks(tree: ttk.Treeview) -> None:
+        selected = set(tree.selection())
+        children = tree.get_children()
+        for iid in children:
+            tree.set(iid, CHECK_COLUMN, CHECKED if iid in selected else UNCHECKED)
+        all_checked = bool(children) and selected.issuperset(children)
+        tree.heading(CHECK_COLUMN, text=CHECKED if all_checked else UNCHECKED)
+
+    @staticmethod
+    def _toggle_all_checked(tree: ttk.Treeview) -> None:
+        children = tree.get_children()
+        if children and set(tree.selection()).issuperset(children):
+            tree.selection_remove(*children)
+        else:
+            tree.selection_set(children)
 
     def _enable_tree_sorting(self, tree: ttk.Treeview,
                              keys: dict[str, Callable[[str], str]] | None = None) -> None:
@@ -916,7 +1102,8 @@ class AutomationApp(tk.Tk):
         """
         self._tree_sort_keys[str(tree)] = keys or {}
         for column in tree["columns"]:
-            tree.heading(column, command=lambda c=column: self._toggle_tree_sort(tree, c))
+            if column != CHECK_COLUMN:
+                tree.heading(column, command=lambda c=column: self._toggle_tree_sort(tree, c))
 
     def _toggle_tree_sort(self, tree: ttk.Treeview, column: str) -> None:
         current = self._tree_sort.get(str(tree))
@@ -941,6 +1128,8 @@ class AutomationApp(tk.Tk):
         for index, iid in enumerate(filled + empty):
             tree.move(iid, "", index)
         for name in tree["columns"]:
+            if name == CHECK_COLUMN:
+                continue
             title = tree.heading(name, "text").rstrip(" ▲▼")
             if name == column:
                 title += " ▼" if descending else " ▲"
@@ -977,11 +1166,6 @@ class AutomationApp(tk.Tk):
             self.supplier_contacts_var.get(), CONTACT_FILTERS[ANY_CONTACTS]
         )
         self._campaign_supplier_ids = []
-        compose_list = getattr(self, "compose_suppliers_list", None)
-        if compose_list is not None and compose_list.winfo_exists():
-            compose_list.delete(0, "end")
-        else:
-            compose_list = None
         self._supplier_rows = {int(row["id"]): row for row in suppliers}
         for row in suppliers:
             iid = str(row["id"])
@@ -1009,19 +1193,19 @@ class AutomationApp(tk.Tk):
             if row["excluded"] or not row["email"]:
                 continue
             self._campaign_supplier_ids.append(int(row["id"]))
-            if compose_list is not None:
-                compose_list.insert("end", f"{row['name']}  <{row['email']}>")
         self._apply_tree_sort(self.suppliers_tree)
         visible = [iid for iid in selected if self.suppliers_tree.exists(iid)]
         if visible:
             self.suppliers_tree.selection_set(visible)
+        self._sync_checkmarks(self.suppliers_tree)
         self._update_suppliers_count()
+        self._fill_compose_recipients()
 
     def _update_suppliers_count(self) -> None:
         shown = len(self.suppliers_tree.get_children())
         selected = len(self.suppliers_tree.selection())
         self.suppliers_count_var.set(
-            f"Показано {shown} из {len(self._supplier_rows)}, выбрано {selected}"
+            f"Показано {shown} из {len(self._supplier_rows)}, отмечено {selected}"
         )
 
     def refresh_campaigns(self) -> None:
@@ -1039,6 +1223,7 @@ class AutomationApp(tk.Tk):
                     CAMPAIGN_STATUS_LABELS.get(row["status"], row["status"]),
                 ),
             )
+        self._apply_tree_sort(self.campaigns_tree)
         if selected_id and self.campaigns_tree.exists(selected_id):
             self.campaigns_tree.selection_set(selected_id)
         elif self.campaigns_tree.get_children():
@@ -1217,7 +1402,7 @@ class AutomationApp(tk.Tk):
     def _set_selected_suppliers_excluded(self, excluded: bool) -> None:
         supplier_ids = self._selected_ids(self.suppliers_tree)
         if not supplier_ids:
-            self.status_var.set("Выберите поставщиков в таблице")
+            self.status_var.set("Отметьте поставщиков в таблице")
             return
         reason = ""
         if excluded:
@@ -1237,7 +1422,7 @@ class AutomationApp(tk.Tk):
     def _change_selected_suppliers_category(self, remove: bool) -> None:
         supplier_ids = self._selected_ids(self.suppliers_tree)
         if not supplier_ids:
-            self.status_var.set("Выберите поставщиков в таблице")
+            self.status_var.set("Отметьте поставщиков в таблице")
             return
         category = simpledialog.askstring(
             "Категория",
@@ -1302,6 +1487,7 @@ class AutomationApp(tk.Tk):
         visible = [iid for iid in selected if self.candidates_tree.exists(iid)]
         if visible:
             self.candidates_tree.selection_set(visible)
+        self._sync_checkmarks(self.candidates_tree)
         self._on_candidate_selected()
 
     def _reset_candidate_filters(self) -> None:
@@ -1315,14 +1501,14 @@ class AutomationApp(tk.Tk):
         shown = len(self.candidates_tree.get_children())
         selected = len(self.candidates_tree.selection())
         self.candidates_count_var.set(
-            f"Показано {shown} из {len(self._candidate_rows)}, выбрано {selected}"
+            f"Показано {shown} из {len(self._candidate_rows)}, отмечено {selected}"
         )
 
     def _on_candidate_selected(self, _event: tk.Event | None = None) -> None:
         self._update_candidates_count()
         selection = self.candidates_tree.selection()
         if len(selection) != 1:
-            # Карточка редактирует одну компанию; для группы — меню «Действия с выбранными».
+            # Карточка редактирует одну компанию; для группы — меню «Действия с отмеченными».
             self._selected_candidate_id = None
             self._clear_candidate_form()
             return
@@ -1367,7 +1553,7 @@ class AutomationApp(tk.Tk):
     def _approve_selected_candidates(self) -> None:
         candidate_ids = self._selected_ids(self.candidates_tree)
         if not candidate_ids:
-            self.search_status_var.set("Выберите компании в таблице")
+            self.search_status_var.set("Отметьте компании в таблице")
             return
         if len(candidate_ids) > 1 and not messagebox.askyesno(
             "Справочник", f"Добавить в справочник выбранные компании: {len(candidate_ids)}?",
@@ -1399,7 +1585,7 @@ class AutomationApp(tk.Tk):
     def _set_selected_candidates_status(self, status: str) -> None:
         candidate_ids = self._selected_ids(self.candidates_tree)
         if not candidate_ids:
-            self.search_status_var.set("Выберите компании в таблице")
+            self.search_status_var.set("Отметьте компании в таблице")
             return
         changed = skipped = 0
         for candidate_id in candidate_ids:
@@ -1418,7 +1604,7 @@ class AutomationApp(tk.Tk):
     def _add_category_to_selected_candidates(self) -> None:
         candidate_ids = self._selected_ids(self.candidates_tree)
         if not candidate_ids:
-            self.search_status_var.set("Выберите компании в таблице")
+            self.search_status_var.set("Отметьте компании в таблице")
             return
         category = simpledialog.askstring(
             "Категория", f"Добавить категорию ({len(candidate_ids)} комп.):", parent=self
@@ -1435,7 +1621,7 @@ class AutomationApp(tk.Tk):
     def _delete_selected_candidates(self) -> None:
         candidate_ids = self._selected_ids(self.candidates_tree)
         if not candidate_ids:
-            self.search_status_var.set("Выберите компании в таблице")
+            self.search_status_var.set("Отметьте компании в таблице")
             return
         if not messagebox.askyesno(
             "Удаление",
@@ -1570,7 +1756,7 @@ class AutomationApp(tk.Tk):
         if only_selected:
             ids = self._selected_ids(self.candidates_tree)
             if not ids:
-                messagebox.showinfo("Excel", "Выберите компании в таблице.", parent=self)
+                messagebox.showinfo("Excel", "Отметьте компании в таблице.", parent=self)
                 return
         else:
             # «Все» — всё, что показано в таблице с учётом фильтра.
@@ -1608,10 +1794,10 @@ class AutomationApp(tk.Tk):
             self.compose_attachments_list.delete(index)
 
     def _create_campaign(self) -> None:
-        indexes = self.compose_suppliers_list.curselection()
-        supplier_ids = [self._campaign_supplier_ids[index] for index in indexes]
+        supplier_ids = [value for value in self._campaign_supplier_ids
+                        if value in self._compose_checked]
         if not supplier_ids:
-            messagebox.showwarning("Рассылка", "Выберите хотя бы одного поставщика.",
+            messagebox.showwarning("Рассылка", "Отметьте хотя бы одного поставщика.",
                                    parent=self._compose_dialog or self)
             return
         if not messagebox.askyesno(
@@ -1669,7 +1855,10 @@ class AutomationApp(tk.Tk):
 
     def _load_recipients(self, campaign_id: int, recipients: list[sqlite3.Row] | None = None) -> None:
         self.recipients_tree.delete(*self.recipients_tree.get_children())
-        for row in recipients if recipients is not None else self.db.list_recipients(campaign_id):
+        if recipients is None:
+            recipients = self.db.list_recipients(campaign_id)
+        self._recipient_rows = {int(row["id"]): row for row in recipients}
+        for row in recipients:
             self.recipients_tree.insert(
                 "",
                 "end",
@@ -1681,6 +1870,7 @@ class AutomationApp(tk.Tk):
                     display_datetime(row["last_response_at"]),
                 ),
             )
+        self._apply_tree_sort(self.recipients_tree)
 
     def _load_campaign_responses(self, replies: list[sqlite3.Row]) -> None:
         self.campaign_inbox_tree.delete(*self.campaign_inbox_tree.get_children())
