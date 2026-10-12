@@ -148,6 +148,21 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue(first_created and second_created)
         self.assertNotEqual(first_id, second_id)
 
+    def test_incoming_stays_unopened_until_marked(self) -> None:
+        incoming_id, _created = self.db.insert_incoming(
+            mailbox="buyer@mail.ru", folder="INBOX", uid_validity="42", imap_uid=101,
+            campaign_id=None, recipient_id=None, message_id="<first@example.ru>",
+            in_reply_to="", sender_email="supplier@example.ru", subject="Ответ",
+            received_at=None, body_text="", raw_eml_path="first.eml",
+            match_method="manual", needs_review=True,
+        )
+        self.assertIsNone(self.db.get_incoming(incoming_id)["opened_at"])
+        self.db.mark_incoming_opened(incoming_id)
+        opened_at = self.db.get_incoming(incoming_id)["opened_at"]
+        self.assertIsNotNone(opened_at)
+        self.db.mark_incoming_opened(incoming_id)
+        self.assertEqual(self.db.get_incoming(incoming_id)["opened_at"], opened_at)
+
     def test_existing_database_is_migrated_without_losing_incoming(self) -> None:
         old_path = Path(self.temp.name) / "old.db"
         with closing(sqlite3.connect(old_path)) as connection:
@@ -187,6 +202,7 @@ class DatabaseTests(unittest.TestCase):
             row = connection.execute("SELECT * FROM incoming_messages WHERE id = 1").fetchone()
             self.assertEqual(row["message_id"], "<old@example.ru>")
             self.assertEqual(row["uid_validity"], "legacy")
+            self.assertIsNone(row["opened_at"])
             attachment = connection.execute("SELECT * FROM attachments WHERE id = 1").fetchone()
             self.assertEqual(attachment["incoming_message_id"], 1)
             self.assertFalse(connection.execute("PRAGMA foreign_key_check").fetchall())

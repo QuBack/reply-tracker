@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS incoming_messages (
     needs_review INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     processed_at TEXT,
+    opened_at TEXT,
     UNIQUE(mailbox, folder, uid_validity, imap_uid)
 );
 
@@ -292,6 +293,13 @@ class Database:
             }
             if "uid_validity" not in columns:
                 self._migrate_incoming_messages(connection)
+                columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(incoming_messages)")
+                }
+            # Пустое opened_at — письмо ещё не открывали, строка в переписке подсвечена.
+            if "opened_at" not in columns:
+                connection.execute("ALTER TABLE incoming_messages ADD COLUMN opened_at TEXT")
             outgoing_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(outgoing_messages)")
             }
@@ -1243,6 +1251,13 @@ class Database:
         with self.connect() as connection:
             connection.execute(
                 "UPDATE incoming_messages SET processed_at = ? WHERE id = ?",
+                (utc_now(), incoming_id),
+            )
+
+    def mark_incoming_opened(self, incoming_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE incoming_messages SET opened_at = ? WHERE id = ? AND opened_at IS NULL",
                 (utc_now(), incoming_id),
             )
 

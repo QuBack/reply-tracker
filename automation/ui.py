@@ -13,6 +13,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from typing import Callable, Iterable
 
+from tkcalendar import DateEntry
+
 from .database import Database
 from .mail_gateway import MAIL_PROVIDERS
 from .service import AppService, OperationResult, ReplyDraft
@@ -131,6 +133,79 @@ def display_datetime(value: str | None, *, with_time: bool = True) -> str:
         return parsed.strftime("%d.%m.%Y %H:%M" if with_time else "%d.%m.%Y")
     except ValueError:
         return value
+
+
+def local_date(value: str | None) -> date | None:
+    """Дата по местному времени — та, что показана в таблице."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return (parsed.astimezone() if parsed.tzinfo else parsed).date()
+
+
+def date_in_range(value: str | None, start: date | None, end: date | None) -> bool:
+    """Обе границы включительно; пустая граница не ограничивает."""
+    if start is None and end is None:
+        return True
+    day = local_date(value)
+    if day is None:
+        return False
+    return (start is None or day >= start) and (end is None or day <= end)
+
+
+class OptionalDateEntry(DateEntry):
+    """Поле даты с календарём, которое может быть пустым — тогда граница не задана."""
+
+    def __init__(self, master: tk.Misc, on_change: Callable[[], None]) -> None:
+        # Ссылку храним: без неё StringVar удалится вместе со своим trace.
+        self._text = variable = tk.StringVar()
+        super().__init__(master, textvariable=variable, date_pattern="dd.MM.yyyy",
+                         locale="ru_RU", width=11)
+        # Календарь разбирает текст поля при открытии; для пустого берём последнюю дату.
+        parse = self.parse_date
+        self.parse_date = lambda text: parse(text) if text.strip() else self._date
+        self.delete(0, "end")
+        variable.trace_add("write", lambda *_args: on_change())
+
+    def value(self) -> date | None:
+        try:
+            return datetime.strptime(self.get().strip(), "%d.%m.%Y").date()
+        except ValueError:
+            return None
+
+    def _validate_date(self) -> bool:
+        value = self.value()
+        if value is not None:
+            self._date = value
+        elif self.get().strip():
+            # Нераспознанную дату стираем, чтобы в поле не оставалось то, что фильтр не применяет.
+            self.delete(0, "end")
+            # Tk отключает проверку, если её команда меняет текст поля.
+            self.after_idle(lambda: self.configure(validate="focusout"))
+        return True
+
+
+class DateRangeFilter(ttk.Frame):
+    """Фильтр «Дата с … по …»: можно задать одну границу или обе."""
+
+    def __init__(self, master: tk.Misc, on_change: Callable[[], None]) -> None:
+        super().__init__(master)
+        ttk.Label(self, text="Дата с").pack(side="left", padx=(0, 6))
+        self.start = OptionalDateEntry(self, on_change)
+        self.start.pack(side="left")
+        ttk.Label(self, text="по").pack(side="left", padx=6)
+        self.end = OptionalDateEntry(self, on_change)
+        self.end.pack(side="left")
+
+    def matches(self, value: str | None) -> bool:
+        return date_in_range(value, self.start.value(), self.end.value())
+
+    def clear(self) -> None:
+        self.start.delete(0, "end")
+        self.end.delete(0, "end")
 
 
 class AutomationApp(tk.Tk):
@@ -261,6 +336,8 @@ class AutomationApp(tk.Tk):
         )
         supplier_contacts_box.grid(row=0, column=3, padx=(8, 0))
         supplier_contacts_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_suppliers())
+        self.supplier_dates = DateRangeFilter(filters, self.refresh_suppliers)
+        self.supplier_dates.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
         self.suppliers_tree = self._make_tree(
             left,
             [
@@ -417,6 +494,8 @@ class AutomationApp(tk.Tk):
         ttk.Button(filters, text="Сбросить", command=self._reset_candidate_filters).grid(
             row=0, column=5, padx=(6, 0)
         )
+        self.candidate_dates = DateRangeFilter(filters, self._fill_candidates_tree)
+        self.candidate_dates.grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
         for variable in (self.candidate_filter_text_var, self.candidate_filter_status_var,
                          self.candidate_filter_category_var, self.candidate_filter_contacts_var):
             variable.trace_add("write", lambda *_args: self._fill_candidates_tree())
@@ -603,6 +682,8 @@ class AutomationApp(tk.Tk):
         self.compose_category_box.grid(row=0, column=1, padx=(6, 0))
         for variable in (self.compose_search_var, self.compose_category_var):
             variable.trace_add("write", lambda *_args: self._fill_compose_recipients())
+        self.compose_dates = DateRangeFilter(recipient_filters, self._fill_compose_recipients)
+        self.compose_dates.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self.compose_recipients_tree = self._make_tree(recipients, [
             ("name", "Поставщик", 170),
             ("email", "Email", 150),
@@ -702,6 +783,8 @@ class AutomationApp(tk.Tk):
             if category != ALL_CATEGORIES.casefold() and category not in row_categories:
                 continue
             if not text_matches(search, row["name"], row["email"], row["categories"]):
+                continue
+            if not self.compose_dates.matches(row["created_at"]):
                 continue
             tree.insert("", "end", iid=str(row["id"]), values=(
                 row["name"], row["email"], row["categories"],
@@ -835,6 +918,8 @@ class AutomationApp(tk.Tk):
 
         recipients = ttk.LabelFrame(right, text="Поставщики", padding=8)
         recipients.pack(fill="both", expand=True, pady=(0, 10))
+        self.recipient_dates = DateRangeFilter(recipients, self._reload_recipients)
+        self.recipient_dates.pack(anchor="w", pady=(0, 6))
         self.recipients_tree = self._make_tree(
             recipients,
             [
@@ -876,6 +961,7 @@ class AutomationApp(tk.Tk):
         self.campaign_inbox_tree.pack(fill="both", expand=True)
         self.campaign_inbox_tree.tag_configure("ours", foreground="#2F5D8A")
         self.campaign_inbox_tree.tag_configure("failed", foreground="#9A3A3A")
+        self.campaign_inbox_tree.tag_configure("unread", background="#FFF1A8")
         self.campaign_inbox_tree.bind("<Double-1>", self._open_campaign_response)
         response_buttons = ttk.Frame(responses)
         response_buttons.pack(fill="x", pady=(8, 0))
@@ -1196,6 +1282,7 @@ class AutomationApp(tk.Tk):
             category_ok = (selected_category == ALL_CATEGORIES or
                            selected_category.casefold() in (value.casefold() for value in row_categories))
             if (category_ok and contacts_match(bool(row["email"]), bool(phones)) and
+                    self.supplier_dates.matches(row["created_at"]) and
                     text_matches(search, row["name"], row["email"], row["categories"], row["notes"],
                                  " ".join(phones), row["contact_person"], row["address"],
                                  row["website"])):
@@ -1493,6 +1580,8 @@ class AutomationApp(tk.Tk):
                 continue
             if not contacts_match(bool(row["email"]), bool(phones)):
                 continue
+            if not self.candidate_dates.matches(row["created_at"]):
+                continue
             if not text_matches(search, row["name"], row["email"], row["website"],
                                 row["region"], row["evidence"], row["search_query"],
                                 " ".join(categories), " ".join(phones),
@@ -1517,6 +1606,7 @@ class AutomationApp(tk.Tk):
         self.candidate_filter_status_var.set(ALL_STATUSES)
         self.candidate_filter_category_var.set(ALL_CATEGORIES)
         self.candidate_filter_contacts_var.set(ANY_CONTACTS)
+        self.candidate_dates.clear()
         self._fill_candidates_tree()
 
     def _update_candidates_count(self) -> None:
@@ -1875,12 +1965,19 @@ class AutomationApp(tk.Tk):
         self._load_recipients(campaign_id, recipients)
         self._load_campaign_responses(campaign_id, replies)
 
+    def _reload_recipients(self) -> None:
+        campaign_id = self._selected_tree_id(self.campaigns_tree)
+        if campaign_id is not None:
+            self._load_recipients(campaign_id)
+
     def _load_recipients(self, campaign_id: int, recipients: list[sqlite3.Row] | None = None) -> None:
         self.recipients_tree.delete(*self.recipients_tree.get_children())
         if recipients is None:
             recipients = self.db.list_recipients(campaign_id)
         self._recipient_rows = {int(row["id"]): row for row in recipients}
         for row in recipients:
+            if not self.recipient_dates.matches(row["last_response_at"]):
+                continue
             self.recipients_tree.insert(
                 "",
                 "end",
@@ -1904,7 +2001,7 @@ class AutomationApp(tk.Tk):
             entries.append((timestamp_key(when), str(row["id"]), (
                 display_datetime(when), row["sender_email"], row["subject"],
                 row["attachment_count"] or 0,
-            ), ()))
+            ), () if row["opened_at"] else ("unread",)))
         for row in self.db.list_sent_replies(campaign_id):
             failed = row["delivery_status"] == "failed"
             subject = ("⚠ не отправлено: " if failed else "") + row["subject"]
@@ -2093,6 +2190,9 @@ class AutomationApp(tk.Tk):
         message = self.db.get_incoming(incoming_id)
         if message is None:
             return
+        if message["opened_at"] is None:
+            self.db.mark_incoming_opened(incoming_id)
+            self.campaign_inbox_tree.item(str(incoming_id), tags=())
         dialog = tk.Toplevel(self)
         dialog.title("Ответ поставщика")
         dialog.geometry("860x610")
