@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import queue
+import shutil
 import sqlite3
 import threading
 import time
@@ -135,15 +136,31 @@ def display_datetime(value: str | None, *, with_time: bool = True) -> str:
         return value
 
 
-def local_date(value: str | None) -> date | None:
-    """Дата по местному времени — та, что показана в таблице."""
+def local_datetime(value: str | None) -> datetime | None:
+    """Время по местному часовому поясу — то, что показано в таблицах."""
     if not value:
         return None
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
-    return (parsed.astimezone() if parsed.tzinfo else parsed).date()
+    return parsed.astimezone() if parsed.tzinfo else parsed
+
+
+def local_date(value: str | None) -> date | None:
+    """Дата по местному времени — та, что показана в таблице."""
+    parsed = local_datetime(value)
+    return parsed.date() if parsed else None
+
+
+MONTHS_GENITIVE = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+                   "августа", "сентября", "октября", "ноября", "декабря")
+WEEKDAYS = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
+
+
+def day_label(day: date) -> str:
+    """Заголовок дня в переписке: «15 октября 2026, четверг»."""
+    return f"{day.day} {MONTHS_GENITIVE[day.month - 1]} {day.year}, {WEEKDAYS[day.weekday()]}"
 
 
 def date_in_range(value: str | None, start: date | None, end: date | None) -> bool:
@@ -154,6 +171,17 @@ def date_in_range(value: str | None, start: date | None, end: date | None) -> bo
     if day is None:
         return False
     return (start is None or day >= start) and (end is None or day <= end)
+
+
+def free_destination(folder: Path, filename: str) -> Path:
+    """Путь для сохранения, не затирающий существующий файл: «счёт (2).pdf»."""
+    candidate = folder / filename
+    stem, suffix = Path(filename).stem, Path(filename).suffix
+    number = 2
+    while candidate.exists():
+        candidate = folder / f"{stem} ({number}){suffix}"
+        number += 1
+    return candidate
 
 
 class OptionalDateEntry(DateEntry):
@@ -928,6 +956,7 @@ class AutomationApp(tk.Tk):
                 ("files", "Файлов", 70),
                 ("response", "Последний ответ", 145),
             ],
+            selectmode="extended",
         )
         self._enable_tree_sorting(self.recipients_tree, {
             "files": lambda iid: f"{self._recipient_rows[int(iid)]['file_count']:09d}",
@@ -937,10 +966,12 @@ class AutomationApp(tk.Tk):
         self.recipients_tree.pack(fill="both", expand=True)
         recipient_buttons = ttk.Frame(recipients)
         recipient_buttons.pack(fill="x", pady=(8, 0))
-        ttk.Button(recipient_buttons, text="Написать поставщику",
-                   command=self._write_to_selected_recipient).pack(side="left")
-        recipient_actions = ttk.Menubutton(recipient_buttons, text="Изменить состояние адресата")
-        recipient_actions.pack(side="left", padx=6)
+        ttk.Button(recipient_buttons, text="Переписка",
+                   command=self._open_selected_recipient_thread).pack(side="left")
+        ttk.Button(recipient_buttons, text="Написать",
+                   command=self._write_to_selected_recipient).pack(side="left", padx=6)
+        recipient_actions = ttk.Menubutton(recipient_buttons, text="Состояние")
+        recipient_actions.pack(side="left")
         recipient_menu = tk.Menu(recipient_actions, tearoff=False)
         for label, status in (("Закрыть без ответа", "closed_no_response"),
                               ("Отказ поставщика", "declined"),
@@ -948,7 +979,15 @@ class AutomationApp(tk.Tk):
             recipient_menu.add_command(
                 label=label, command=lambda value=status: self._set_selected_recipient_status(value)
             )
+        recipient_menu.add_separator()
+        recipient_menu.add_command(label="Убрать из рассылки (если ещё не отправляли)",
+                                   command=self._remove_unsent_recipients)
         recipient_actions["menu"] = recipient_menu
+        ttk.Button(recipient_buttons, text="Отправить новым",
+                   command=self._send_to_new_recipients).pack(side="right")
+        ttk.Button(recipient_buttons, text="Добавить поставщиков",
+                   command=self._open_add_recipients_dialog).pack(side="right", padx=6)
+        self.recipients_tree.bind("<Double-1>", self._open_selected_recipient_thread)
 
         responses = ttk.LabelFrame(right, text="Переписка по этой рассылке", padding=8)
         responses.pack(fill="both", expand=True)
@@ -956,20 +995,24 @@ class AutomationApp(tk.Tk):
             responses,
             [("received", "Получено", 135), ("sender", "Отправитель", 185),
              ("subject", "Тема", 230), ("files", "Файлов", 65)],
+            selectmode="extended",
         )
         self.campaign_inbox_tree.configure(height=7)
+        # Кнопки пакуем раньше таблицы: в невысоком окне сжимается таблица, а не они.
+        response_buttons = ttk.Frame(responses)
+        response_buttons.pack(side="bottom", fill="x", pady=(8, 0))
         self.campaign_inbox_tree.pack(fill="both", expand=True)
         self.campaign_inbox_tree.tag_configure("ours", foreground="#2F5D8A")
         self.campaign_inbox_tree.tag_configure("failed", foreground="#9A3A3A")
         self.campaign_inbox_tree.tag_configure("unread", background="#FFF1A8")
         self.campaign_inbox_tree.bind("<Double-1>", self._open_campaign_response)
-        response_buttons = ttk.Frame(responses)
-        response_buttons.pack(fill="x", pady=(8, 0))
         ttk.Button(response_buttons, text="Открыть", command=self._open_campaign_response).pack(
             side="left"
         )
         ttk.Button(response_buttons, text="Ответить",
                    command=self._reply_to_selected_response).pack(side="left", padx=6)
+        ttk.Button(response_buttons, text="Сделать непрочитанным",
+                   command=self._mark_selected_responses_unread).pack(side="left")
 
     def _build_inbox_tab(self) -> None:
         self.inbox_tab.columnconfigure(0, weight=1)
@@ -1040,8 +1083,15 @@ class AutomationApp(tk.Tk):
                 ("type", "Тип", 80),
                 ("duplicate", "Дубль", 65),
             ],
+            selectmode="extended",
         )
         self.incoming_files_tree.grid(row=0, column=0, sticky="nsew")
+        ttk.Button(files_frame, text="Скачать", command=lambda: self._download_attachments(
+            [(self.incoming_files_tree.item(iid, "values")[0],
+              Path(self.incoming_files_tree.item(iid, "tags")[0]))
+             for iid in self._selected_or_all(self.incoming_files_tree)],
+            parent=self,
+        )).grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.incoming_files_tree.bind("<Double-1>", self._open_selected_attachment)
 
     def _build_logs_tab(self) -> None:
@@ -1994,7 +2044,7 @@ class AutomationApp(tk.Tk):
     def _load_campaign_responses(self, campaign_id: int, replies: list[sqlite3.Row]) -> None:
         tree = self.campaign_inbox_tree
         tree.delete(*tree.get_children())
-        # Письма поставщиков и наши ответы — одна лента, новые сверху.
+        # Письма поставщиков и все наши письма (рассылка и ответы) — одна лента, новые сверху.
         entries: list[tuple[datetime, str, tuple, tuple[str, ...]]] = []
         for row in replies:
             when = row["received_at"] or row["created_at"]
@@ -2002,12 +2052,12 @@ class AutomationApp(tk.Tk):
                 display_datetime(when), row["sender_email"], row["subject"],
                 row["attachment_count"] or 0,
             ), () if row["opened_at"] else ("unread",)))
-        for row in self.db.list_sent_replies(campaign_id):
+        for row in self.db.list_sent_letters(campaign_id):
             failed = row["delivery_status"] == "failed"
             subject = ("⚠ не отправлено: " if failed else "") + row["subject"]
             entries.append((timestamp_key(row["sent_at"]), f"out-{row['id']}", (
                 display_datetime(row["sent_at"]), f"Мы → {row['to_email']}", subject,
-                len(json.loads(row["attachments_json"])),
+                row["attachment_count"],
             ), ("failed",) if failed else ("ours",)))
         entries.sort(key=lambda entry: entry[0], reverse=True)
         for _when, iid, values, tags in entries:
@@ -2023,6 +2073,18 @@ class AutomationApp(tk.Tk):
             return "out", int(iid[4:])
         return "in", int(iid)
 
+    def _mark_selected_responses_unread(self) -> None:
+        tree = self.campaign_inbox_tree
+        # Наши ответы (out-…) прочитанности не имеют — пропускаем их.
+        incoming_ids = [int(iid) for iid in tree.selection() if not iid.startswith("out-")]
+        if not incoming_ids:
+            self.status_var.set("Выберите письма поставщиков в переписке")
+            return
+        self.db.mark_incoming_unread(incoming_ids)
+        for incoming_id in incoming_ids:
+            tree.item(str(incoming_id), tags=("unread",))
+        self.status_var.set(f"Непрочитанными помечено писем: {len(incoming_ids)}")
+
     def _reply_to_selected_response(self) -> None:
         selected = self._selected_response()
         if selected is None:
@@ -2035,6 +2097,254 @@ class AutomationApp(tk.Tk):
         outgoing = self.db.get_outgoing(item_id)
         if outgoing is not None:
             self._open_reply_dialog(recipient_id=int(outgoing["recipient_id"]))
+
+    def _open_add_recipients_dialog(self) -> None:
+        campaign_id = self._selected_tree_id(self.campaigns_tree)
+        if campaign_id is None:
+            self.status_var.set("Выберите рассылку")
+            return
+        campaign = self.db.get_campaign(campaign_id)
+        if campaign is None or campaign["status"] == "closed":
+            messagebox.showinfo("Рассылка", "Рассылка завершена — в неё нельзя добавить поставщиков.",
+                                parent=self)
+            return
+        taken = {int(row["supplier_id"]) for row in self.db.list_recipients(campaign_id)}
+        candidates = [self._supplier_rows[value] for value in self._campaign_supplier_ids
+                      if value in self._supplier_rows and value not in taken]
+        if not candidates:
+            messagebox.showinfo("Рассылка", "Все поставщики с email уже в этой рассылке.", parent=self)
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title(f"Добавить поставщиков — {campaign['name']}")
+        dialog.geometry("760x520")
+        dialog.transient(self)
+        frame = ttk.Frame(dialog, padding=14)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Отметьте поставщиков галочками. Письмо им уйдёт "
+                  "по кнопке «Отправить новым».", style="Muted.TLabel").pack(anchor="w")
+        search_var = tk.StringVar()
+        search = ttk.Entry(frame, textvariable=search_var)
+        search.pack(fill="x", pady=(8, 6))
+        tree = self._make_tree(frame, [("name", "Поставщик", 260), ("email", "Email", 220),
+                                       ("categories", "Категории", 220)],
+                               selectmode="extended", checkboxes=True)
+        tree.pack(fill="both", expand=True)
+        self._enable_checkboxes(tree)
+        # Отметки переживают поиск: поставщик, скрытый фильтром, остаётся отмеченным.
+        checked: set[str] = set()
+
+        def remember(_event: tk.Event | None = None) -> None:
+            shown = set(tree.get_children())
+            checked.difference_update(shown)
+            checked.update(tree.selection())
+
+        tree.bind("<<TreeviewSelect>>", remember, add="+")
+
+        def fill() -> None:
+            tree.delete(*tree.get_children())
+            for row in candidates:
+                if text_matches(search_var.get(), row["name"], row["email"], row["categories"]):
+                    tree.insert("", "end", iid=str(row["id"]),
+                                values=(row["name"], row["email"], row["categories"], UNCHECKED))
+            tree.selection_set([iid for iid in tree.get_children() if iid in checked])
+            self._sync_checkmarks(tree)
+
+        def add() -> None:
+            supplier_ids = [int(iid) for iid in checked]
+            if not supplier_ids:
+                self.status_var.set("Отметьте поставщиков в списке")
+                return
+            try:
+                added = self.db.add_campaign_recipients(campaign_id, supplier_ids)
+            except ValueError as exc:
+                messagebox.showwarning("Рассылка", str(exc), parent=dialog)
+                return
+            dialog.destroy()
+            self.refresh_all()
+            self.status_var.set(f"Добавлено поставщиков: {added}. Письмо уйдёт по «Отправить новым».")
+
+        search_var.trace_add("write", lambda *_args: fill())
+        fill()
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="Отмена", command=dialog.destroy).pack(side="right")
+        ttk.Button(buttons, text="Добавить", command=add).pack(side="right", padx=6)
+        search.focus_set()
+
+    def _send_to_new_recipients(self) -> None:
+        campaign_id = self._selected_tree_id(self.campaigns_tree)
+        if campaign_id is None:
+            self.status_var.set("Выберите рассылку")
+            return
+        waiting = [row for row in self.db.list_recipients(campaign_id)
+                   if row["status"] in ("pending", "send_failed") and not row["supplier_excluded"]]
+        if not waiting:
+            messagebox.showinfo("Рассылка", "Все адресаты уже получили письмо.", parent=self)
+            return
+        names = ", ".join(row["supplier_name"] for row in waiting[:5])
+        if len(waiting) > 5:
+            names += f" и ещё {len(waiting) - 5}"
+        if not messagebox.askyesno("Отправка", f"Отправить письмо рассылки: {names}?", parent=self):
+            return
+        self._retry_campaign()
+
+    def _remove_unsent_recipients(self) -> None:
+        campaign_id = self._selected_tree_id(self.campaigns_tree)
+        recipient_ids = self._selected_ids(self.recipients_tree)
+        if campaign_id is None or not recipient_ids:
+            self.status_var.set("Выделите поставщиков в списке рассылки")
+            return
+        removed = self.db.remove_unsent_recipients(campaign_id, recipient_ids)
+        self.refresh_all()
+        skipped = len(recipient_ids) - removed
+        self.status_var.set(f"Убрано из рассылки: {removed}" +
+                            (f", пропущено (уже была переписка): {skipped}" if skipped else ""))
+
+    def _open_selected_recipient_thread(self, _event: tk.Event | None = None) -> None:
+        recipient_id = self._selected_tree_id(self.recipients_tree)
+        if recipient_id is None:
+            self.status_var.set("Выберите поставщика в списке")
+            return
+        self._open_recipient_thread(recipient_id)
+
+    def _open_recipient_thread(self, recipient_id: int,
+                               focus: tuple[str, int] | None = None) -> None:
+        """Переписка с одним поставщиком рассылки: слева письма по дням, справа выбранное."""
+        recipient = self.db.get_recipient(recipient_id)
+        if recipient is None:
+            return
+        letters = sorted(self.db.list_recipient_correspondence(recipient_id),
+                         key=lambda row: (timestamp_key(row["at"]), row["direction"], row["id"]))
+        dialog = tk.Toplevel(self)
+        dialog.title(f"Переписка — {recipient['supplier_name']} [{recipient['campaign_code']}]")
+        dialog.geometry("1100x660")
+        dialog.minsize(820, 480)
+        dialog.transient(self)
+        actions = ttk.Frame(dialog)
+        actions.pack(side="bottom", fill="x", padx=12, pady=(0, 12))
+        panes = ttk.PanedWindow(dialog, orient="horizontal")
+        panes.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+
+        left = ttk.Frame(panes)
+        panes.add(left, weight=2)
+        days = ttk.Treeview(left, show="tree", selectmode="browse")
+        days.column("#0", width=330)
+        days.tag_configure("day", font=("Segoe UI Semibold", 9))
+        days.tag_configure("ours", foreground="#2F5D8A")
+        days.tag_configure("failed", foreground="#9A3A3A")
+        days.tag_configure("unread", background="#FFF1A8")
+        scroll = ttk.Scrollbar(left, orient="vertical", command=days.yview)
+        days.configure(yscrollcommand=scroll.set)
+        days.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="left", fill="y")
+
+        right = ttk.Frame(panes, padding=(10, 0, 0, 0))
+        panes.add(right, weight=5)
+        subject_var, meta_var = tk.StringVar(), tk.StringVar()
+        ttk.Label(right, textvariable=subject_var, style="Section.TLabel",
+                  wraplength=640).pack(anchor="w")
+        ttk.Label(right, textvariable=meta_var, style="Muted.TLabel").pack(anchor="w", pady=(2, 8))
+        files = self._make_tree(right, [("name", "Вложение", 520)], selectmode="extended")
+        files.configure(height=3)
+        file_buttons = ttk.Frame(right)
+        # Снизу вверх: кнопки вложений, вложения, текст — в низком окне сжимается текст.
+        file_buttons.pack(side="bottom", fill="x", pady=(6, 0))
+        files.pack(side="bottom", fill="x")
+        body = scrolledtext.ScrolledText(right, wrap="word", font=("Segoe UI", 10))
+        body.pack(fill="both", expand=True, pady=(0, 8))
+        body.tag_configure("quote", foreground="#7A8594")
+        attachment_paths: dict[str, tuple[str, Path]] = {}
+        ttk.Button(file_buttons, text="Скачать", command=lambda: self._download_attachments(
+            [attachment_paths[iid] for iid in self._selected_or_all(files)], parent=dialog
+        )).pack(side="left")
+        ttk.Label(file_buttons, text="Двойной щелчок по вложению открывает его",
+                  style="Muted.TLabel").pack(side="left", padx=8)
+        files.bind("<Double-1>", lambda _evt: self._open_path(attachment_paths[files.selection()[0]][1])
+                   if files.selection() else None)
+
+        rows = {f"{row['direction']}-{row['id']}": row for row in letters}
+        day_nodes: dict[date, str] = {}
+        for key, row in rows.items():
+            when = local_datetime(row["at"])
+            day = when.date() if when else date.min
+            if day not in day_nodes:
+                day_nodes[day] = days.insert("", "end", text=day_label(day) if when else "Без даты",
+                                             open=True, tags=("day",))
+            ours = row["direction"] == "out"
+            failed = ours and row["delivery_status"] == "failed"
+            who = "Мы" if ours else recipient["supplier_name"]
+            arrow = "→" if ours else "←"
+            clip = "  📎" if row["attachment_count"] else ""
+            text = f"{when:%H:%M}  {arrow} {who}{clip}" if when else f"{arrow} {who}{clip}"
+            if failed:
+                tags: tuple[str, ...] = ("failed",)
+            elif ours:
+                tags = ("ours",)
+            else:
+                tags = () if row["opened_at"] else ("unread",)
+            days.insert(day_nodes[day], "end", iid=key, text=text, tags=tags)
+
+        def show(_event: tk.Event | None = None) -> None:
+            selection = days.selection()
+            if not selection or selection[0] not in rows:
+                return
+            row = rows[selection[0]]
+            ours = row["direction"] == "out"
+            subject_var.set(row["subject"] or "Без темы")
+            state = {"failed": "  •  не отправлено",
+                     "unknown": "  •  исход отправки неизвестен"}.get(row["delivery_status"] or "", "")
+            meta_var.set(f"{'Кому' if ours else 'От'}: {row['address']}  •  "
+                         f"{display_datetime(row['at'])}{state}")
+            body.configure(state="normal")
+            body.delete("1.0", "end")
+            # Цитаты прошлых писем («> …») серым, чтобы новый текст было видно сразу.
+            for line in (row["body"] or "").splitlines():
+                body.insert("end", line + "\n", ("quote",) if line.lstrip().startswith(">") else ())
+            body.configure(state="disabled")
+            files.delete(*files.get_children())
+            attachment_paths.clear()
+            for name, path in self._letter_attachments(row):
+                iid = str(len(attachment_paths))
+                attachment_paths[iid] = (name, path)
+                files.insert("", "end", iid=iid, values=(name,))
+            if not ours and row["opened_at"] is None:
+                self.db.mark_incoming_opened(int(row["id"]))
+                days.item(selection[0], tags=())
+                if self.campaign_inbox_tree.exists(str(row["id"])):
+                    self.campaign_inbox_tree.item(str(row["id"]), tags=())
+
+        days.bind("<<TreeviewSelect>>", show)
+        target = f"{focus[0]}-{focus[1]}" if focus else (list(rows)[-1] if rows else None)
+        if target in rows:
+            days.selection_set(target)
+            days.see(target)
+        else:
+            subject_var.set("Писем пока нет")
+
+        def reply() -> None:
+            selection = days.selection()
+            row = rows.get(selection[0]) if selection else None
+            dialog.destroy()
+            if row is not None and row["direction"] == "in":
+                self._open_reply_dialog(incoming_id=int(row["id"]))
+            else:
+                self._open_reply_dialog(recipient_id=recipient_id)
+
+        ttk.Button(actions, text="Закрыть", command=dialog.destroy).pack(side="right")
+        ttk.Button(actions, text="Ответить", command=reply).pack(side="right", padx=6)
+
+    def _letter_attachments(self, row: sqlite3.Row) -> list[tuple[str, Path]]:
+        """Вложения письма из переписки: (имя для показа, путь к файлу)."""
+        if row["direction"] == "in":
+            return [(item["filename"], Path(item["path"]))
+                    for item in self.db.list_incoming_attachments(int(row["id"]))]
+        outgoing = self.db.get_outgoing(int(row["id"]))
+        if outgoing is None:
+            return []
+        if outgoing["kind"] == "campaign":
+            return [(item["filename"], Path(item["path"]))
+                    for item in self.db.list_outgoing_attachments(int(outgoing["campaign_id"]))]
+        return [(Path(value).name, Path(value)) for value in json.loads(outgoing["attachments_json"])]
 
     def _write_to_selected_recipient(self) -> None:
         recipient_id = self._selected_tree_id(self.recipients_tree)
@@ -2140,53 +2450,21 @@ class AutomationApp(tk.Tk):
         ttk.Button(buttons, text="Отправить", command=send).pack(side="right", padx=6)
         body.focus_set()
 
-    def _open_sent_reply(self, outgoing_id: int) -> None:
-        reply = self.db.get_outgoing(outgoing_id)
-        if reply is None:
-            return
-        dialog = tk.Toplevel(self)
-        dialog.title("Наш ответ")
-        dialog.geometry("820x560")
-        dialog.transient(self)
-        ttk.Label(dialog, text=reply["subject"], style="Header.TLabel").pack(
-            anchor="w", padx=16, pady=(14, 3)
-        )
-        state = {"sent": "отправлено", "failed": "не отправлено",
-                 "unknown": "исход отправки неизвестен"}.get(reply["delivery_status"], "")
-        ttk.Label(dialog, text=f"Кому: {reply['to_email']}  •  "
-                  f"{display_datetime(reply['sent_at'])}  •  {state}").pack(
-            anchor="w", padx=16, pady=(0, 12)
-        )
-        text = scrolledtext.ScrolledText(dialog, wrap="word", height=14, font=("Segoe UI", 10))
-        text.pack(fill="both", expand=True, padx=16, pady=(0, 10))
-        text.insert("1.0", reply["body"])
-        text.configure(state="disabled")
-        attachments = [Path(value) for value in json.loads(reply["attachments_json"])]
-        if attachments:
-            ttk.Label(dialog, text="Вложения — двойной щелчок открывает файл").pack(
-                anchor="w", padx=16
-            )
-            files = tk.Listbox(dialog, height=min(len(attachments), 5), font=("Segoe UI", 9))
-            files.pack(fill="x", padx=16, pady=(4, 10))
-            for path in attachments:
-                files.insert("end", path.name)
-            files.bind("<Double-1>", lambda _evt: self._open_path(attachments[files.curselection()[0]])
-                       if files.curselection() else None)
-        actions = ttk.Frame(dialog)
-        actions.pack(fill="x", padx=16, pady=(0, 14))
-        ttk.Button(actions, text="Закрыть", command=dialog.destroy).pack(side="right")
-        ttk.Button(actions, text="Написать ещё", command=lambda: (
-            dialog.destroy(), self._open_reply_dialog(recipient_id=int(reply["recipient_id"]))
-        )).pack(side="right", padx=6)
-
     def _open_campaign_response(self, _event: tk.Event | None = None) -> None:
         selected = self._selected_response()
         if selected is None:
             return
-        kind, incoming_id = selected
-        if kind == "out":
-            self._open_sent_reply(incoming_id)
+        kind, item_id = selected
+        row = self.db.get_outgoing(item_id) if kind == "out" else self.db.get_incoming(item_id)
+        if row is None:
             return
+        if row["recipient_id"] is not None:
+            self._open_recipient_thread(int(row["recipient_id"]), focus=selected)
+            return
+        # Письмо не привязано к поставщику — показываем его одно.
+        self._open_single_incoming(item_id)
+
+    def _open_single_incoming(self, incoming_id: int) -> None:
         message = self.db.get_incoming(incoming_id)
         if message is None:
             return
@@ -2210,12 +2488,15 @@ class AutomationApp(tk.Tk):
         body.insert("1.0", message["body_text"] or "")
         body.configure(state="disabled")
         ttk.Label(dialog, text="Вложения — двойной щелчок открывает файл").pack(anchor="w", padx=16)
-        files = self._make_tree(dialog, [("name", "Файл", 500), ("type", "Тип", 120)])
+        files = self._make_tree(dialog, [("name", "Файл", 500), ("type", "Тип", 120)],
+                                selectmode="extended")
         files.pack(fill="both", expand=True, padx=16, pady=(4, 10))
         paths: dict[str, Path] = {}
+        names: dict[str, str] = {}
         for attachment in self.db.list_incoming_attachments(incoming_id):
             key = str(attachment["id"])
             paths[key] = Path(attachment["path"])
+            names[key] = attachment["filename"]
             files.insert("", "end", iid=key,
                          values=(attachment["filename"],
                                  "PDF/Excel" if attachment["is_allowed"] else "Другой"))
@@ -2227,6 +2508,10 @@ class AutomationApp(tk.Tk):
         ttk.Button(actions, text="Ответить", command=lambda: (
             dialog.destroy(), self._open_reply_dialog(incoming_id=incoming_id)
         )).pack(side="right", padx=6)
+        if paths:
+            ttk.Button(actions, text="Скачать", command=lambda: self._download_attachments(
+                [(names[key], paths[key]) for key in self._selected_or_all(files)], parent=dialog
+            )).pack(side="left")
 
     def _retry_campaign(self) -> None:
         campaign_id = self._selected_tree_id(self.campaigns_tree)
@@ -2513,6 +2798,38 @@ class AutomationApp(tk.Tk):
 
     def _open_data_folder(self) -> None:
         self._open_path(self.service.paths.root)
+
+    @staticmethod
+    def _selected_or_all(tree: ttk.Treeview) -> list[str]:
+        """Выделенные строки, а если ничего не выделено — все."""
+        return list(tree.selection()) or list(tree.get_children())
+
+    def _download_attachments(self, files: list[tuple[str, Path]], *, parent: tk.Misc) -> None:
+        """Сохраняет вложения под исходными именами: один файл — «Сохранить как», несколько — в папку."""
+        files = [(name, path) for name, path in files if path.is_file()]
+        if not files:
+            self.status_var.set("Нет файлов для скачивания")
+            return
+        downloads = Path.home() / "Downloads"
+        initial_dir = str(downloads if downloads.is_dir() else Path.home())
+        if len(files) == 1:
+            name, source = files[0]
+            target = filedialog.asksaveasfilename(
+                parent=parent, title="Сохранить вложение", initialdir=initial_dir,
+                initialfile=name, defaultextension=Path(name).suffix,
+            )
+            if not target:
+                return
+            shutil.copy2(source, target)
+            self.status_var.set(f"Сохранено: {target}")
+            return
+        folder = filedialog.askdirectory(parent=parent, title="Куда сохранить вложения",
+                                         initialdir=initial_dir)
+        if not folder:
+            return
+        for name, source in files:
+            shutil.copy2(source, free_destination(Path(folder), name))
+        self.status_var.set(f"Сохранено файлов: {len(files)} в {folder}")
 
     @staticmethod
     def _open_path(path: Path) -> None:

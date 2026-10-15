@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import date
 
-from automation.ui import date_in_range
+from automation.ui import date_in_range, day_label
 
 
 class DateInRangeTests(unittest.TestCase):
@@ -31,6 +31,12 @@ class DateInRangeTests(unittest.TestCase):
     def test_row_without_date_is_hidden_when_range_is_set(self) -> None:
         self.assertFalse(date_in_range(None, date(2026, 10, 1), None))
         self.assertFalse(date_in_range("", None, date(2026, 10, 1)))
+
+
+class DayLabelTests(unittest.TestCase):
+    def test_day_label_is_in_russian_with_weekday(self) -> None:
+        self.assertEqual(day_label(date(2026, 10, 15)), "15 октября 2026, четверг")
+        self.assertEqual(day_label(date(2026, 3, 1)), "1 марта 2026, воскресенье")
 
 
 if __name__ == "__main__":

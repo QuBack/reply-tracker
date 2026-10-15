@@ -849,6 +849,66 @@ class Database:
         self.log("info", "campaign_created", campaign_id, {"code": code, "recipients": len(ids)})
         return campaign_id
 
+    def add_campaign_recipients(self, campaign_id: int, supplier_ids: Iterable[int]) -> int:
+        """Добавляет поставщиков в уже созданную рассылку; письмо им уходит отдельной отправкой."""
+        ids = list(dict.fromkeys(int(value) for value in supplier_ids))
+        if not ids:
+            raise ValueError("Не выбран ни один поставщик")
+        with self.connect() as connection:
+            campaign = connection.execute(
+                "SELECT status FROM campaigns WHERE id = ?", (campaign_id,)
+            ).fetchone()
+            if campaign is None:
+                raise ValueError("Рассылка не найдена")
+            if campaign["status"] == "closed":
+                raise ValueError("Рассылка завершена — в неё нельзя добавить поставщиков")
+            placeholders = ",".join("?" for _ in ids)
+            suppliers = connection.execute(
+                f"SELECT id, name, email, excluded FROM suppliers WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            excluded = [row["name"] for row in suppliers if row["excluded"]]
+            if excluded:
+                raise ValueError("Эти поставщики исключены из рассылок: " + ", ".join(excluded))
+            without_email = [row["name"] for row in suppliers if not row["email"]]
+            if without_email:
+                raise ValueError("У этих поставщиков нет email: " + ", ".join(without_email))
+            # Уже участвующих (тот же email) пропускаем молча.
+            added = 0
+            for row in suppliers:
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO campaign_recipients(campaign_id, supplier_id, email) "
+                    "VALUES(?, ?, ?)",
+                    (campaign_id, row["id"], row["email"]),
+                )
+                added += cursor.rowcount
+        if added:
+            self.recompute_campaign(campaign_id)
+            self.log("info", "recipients_added", campaign_id, {"recipients": added})
+        return added
+
+    def remove_unsent_recipients(self, campaign_id: int, recipient_ids: Iterable[int]) -> int:
+        """Убирает из рассылки адресатов, которым ещё ничего не отправляли."""
+        ids = [int(value) for value in recipient_ids]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"""
+                DELETE FROM campaign_recipients
+                WHERE campaign_id = ? AND id IN ({placeholders}) AND status = 'pending'
+                  AND NOT EXISTS (SELECT 1 FROM outgoing_messages o WHERE o.recipient_id = campaign_recipients.id)
+                  AND NOT EXISTS (SELECT 1 FROM incoming_messages m WHERE m.recipient_id = campaign_recipients.id)
+                """,
+                (campaign_id, *ids),
+            )
+            removed = cursor.rowcount
+        if removed:
+            self.recompute_campaign(campaign_id)
+            self.log("info", "recipients_removed", campaign_id, {"recipients": removed})
+        return removed
+
     def add_campaign_attachment(
         self, campaign_id: int, filename: str, path: str, size: int, sha256: str
     ) -> None:
@@ -966,6 +1026,56 @@ class Database:
                 "JOIN suppliers s ON s.id = r.supplier_id "
                 "WHERE o.campaign_id = ? AND o.kind = 'reply' ORDER BY o.id",
                 (campaign_id,),
+            ))
+
+    def list_sent_letters(self, campaign_id: int) -> list[sqlite3.Row]:
+        """Все наши письма по рассылке: само письмо рассылки каждому адресату и ответы."""
+        with self.connect() as connection:
+            return list(connection.execute(
+                """
+                SELECT o.id, o.kind, o.subject, o.sent_at, o.delivery_status,
+                       COALESCE(NULLIF(o.to_email, ''), r.email) AS to_email,
+                       CASE WHEN o.kind = 'campaign'
+                            THEN (SELECT COUNT(*) FROM campaign_attachments ca
+                                  WHERE ca.campaign_id = o.campaign_id)
+                            ELSE json_array_length(o.attachments_json) END AS attachment_count
+                FROM outgoing_messages o
+                JOIN campaign_recipients r ON r.id = o.recipient_id
+                WHERE o.campaign_id = ?
+                ORDER BY o.id
+                """,
+                (campaign_id,),
+            ))
+
+    def list_recipient_correspondence(self, recipient_id: int) -> list[sqlite3.Row]:
+        """Все письма с одним адресатом рассылки — его и наши — в одном списке."""
+        with self.connect() as connection:
+            return list(connection.execute(
+                """
+                SELECT 'in' AS direction, m.id, COALESCE(m.received_at, m.created_at) AS at,
+                       m.sender_email AS address, m.subject, m.body_text AS body,
+                       NULL AS delivery_status, m.opened_at,
+                       (SELECT COUNT(*) FROM attachments a
+                        WHERE a.incoming_message_id = m.id) AS attachment_count
+                FROM incoming_messages m
+                WHERE m.recipient_id = ?
+                UNION ALL
+                SELECT 'out', o.id, o.sent_at, COALESCE(NULLIF(o.to_email, ''), r.email),
+                       o.subject,
+                       -- У писем самой рассылки текст хранится в рассылке, а не в письме.
+                       CASE WHEN o.kind = 'campaign' THEN c.body ELSE o.body END,
+                       o.delivery_status, NULL,
+                       CASE WHEN o.kind = 'campaign'
+                            THEN (SELECT COUNT(*) FROM campaign_attachments ca
+                                  WHERE ca.campaign_id = o.campaign_id)
+                            ELSE json_array_length(o.attachments_json) END
+                FROM outgoing_messages o
+                JOIN campaign_recipients r ON r.id = o.recipient_id
+                JOIN campaigns c ON c.id = o.campaign_id
+                WHERE o.recipient_id = ?
+                ORDER BY at, id
+                """,
+                (recipient_id, recipient_id),
             ))
 
     def get_outgoing(self, outgoing_id: int) -> sqlite3.Row | None:
@@ -1260,6 +1370,14 @@ class Database:
                 "UPDATE incoming_messages SET opened_at = ? WHERE id = ? AND opened_at IS NULL",
                 (utc_now(), incoming_id),
             )
+
+    def mark_incoming_unread(self, incoming_ids: Iterable[int]) -> int:
+        ids = [(int(value),) for value in incoming_ids]
+        with self.connect() as connection:
+            cursor = connection.executemany(
+                "UPDATE incoming_messages SET opened_at = NULL WHERE id = ?", ids
+            )
+            return cursor.rowcount
 
     def update_incoming_raw_path(self, incoming_id: int, raw_path: str) -> None:
         with self.connect() as connection:

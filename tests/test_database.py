@@ -163,6 +163,80 @@ class DatabaseTests(unittest.TestCase):
         self.db.mark_incoming_opened(incoming_id)
         self.assertEqual(self.db.get_incoming(incoming_id)["opened_at"], opened_at)
 
+    def test_opened_messages_can_be_marked_unread_again(self) -> None:
+        ids = []
+        for uid in (201, 202):
+            incoming_id, _created = self.db.insert_incoming(
+                mailbox="buyer@mail.ru", folder="INBOX", uid_validity="42", imap_uid=uid,
+                campaign_id=None, recipient_id=None, message_id=f"<{uid}@example.ru>",
+                in_reply_to="", sender_email="supplier@example.ru", subject="Ответ",
+                received_at=None, body_text="", raw_eml_path=f"{uid}.eml",
+                match_method="manual", needs_review=True,
+            )
+            self.db.mark_incoming_opened(incoming_id)
+            ids.append(incoming_id)
+        self.assertEqual(self.db.mark_incoming_unread(ids), 2)
+        for incoming_id in ids:
+            self.assertIsNone(self.db.get_incoming(incoming_id)["opened_at"])
+
+    def _ready_campaign(self) -> tuple[int, int]:
+        first = self.db.save_supplier("Первый", "one@example.ru")
+        campaign_id = self.db.create_campaign("Тест", "Запрос", "Текст рассылки", None, [first])
+        recipient_id = int(self.db.list_recipients(campaign_id)[0]["id"])
+        self.db.record_outgoing(campaign_id, recipient_id, "<one@test>", "Запрос", "one.eml")
+        self.db.set_recipient_status(recipient_id, "files_received")
+        return campaign_id, recipient_id
+
+    def test_added_recipient_waits_for_sending_and_reopens_campaign(self) -> None:
+        campaign_id, _recipient_id = self._ready_campaign()
+        self.assertEqual(self.db.get_campaign(campaign_id)["status"], "ready")
+        second = self.db.save_supplier("Второй", "two@example.ru")
+        self.assertEqual(self.db.add_campaign_recipients(campaign_id, [second]), 1)
+        added = [row for row in self.db.list_recipients(campaign_id) if row["supplier_id"] == second]
+        self.assertEqual(added[0]["status"], "pending")
+        self.assertEqual(self.db.get_campaign(campaign_id)["status"], "active")
+        # Повторное добавление того же поставщика ничего не меняет.
+        self.assertEqual(self.db.add_campaign_recipients(campaign_id, [second]), 0)
+
+    def test_closed_campaign_does_not_accept_recipients(self) -> None:
+        campaign_id, _recipient_id = self._ready_campaign()
+        self.db.set_campaign_closed(campaign_id)
+        second = self.db.save_supplier("Второй", "two@example.ru")
+        with self.assertRaises(ValueError):
+            self.db.add_campaign_recipients(campaign_id, [second])
+
+    def test_only_unsent_recipients_can_be_removed(self) -> None:
+        campaign_id, sent_recipient = self._ready_campaign()
+        second = self.db.save_supplier("Второй", "two@example.ru")
+        self.db.add_campaign_recipients(campaign_id, [second])
+        new_recipient = next(int(row["id"]) for row in self.db.list_recipients(campaign_id)
+                             if row["supplier_id"] == second)
+        removed = self.db.remove_unsent_recipients(campaign_id, [sent_recipient, new_recipient])
+        self.assertEqual(removed, 1)
+        self.assertEqual([int(row["id"]) for row in self.db.list_recipients(campaign_id)],
+                         [sent_recipient])
+        self.assertEqual(self.db.get_campaign(campaign_id)["status"], "ready")
+
+    def test_sent_letters_include_campaign_letter_with_recipient_address(self) -> None:
+        campaign_id, _recipient_id = self._ready_campaign()
+        letters = self.db.list_sent_letters(campaign_id)
+        self.assertEqual([(row["kind"], row["to_email"]) for row in letters],
+                         [("campaign", "one@example.ru")])
+
+    def test_correspondence_merges_our_letters_and_supplier_replies(self) -> None:
+        campaign_id, recipient_id = self._ready_campaign()
+        self.db.insert_incoming(
+            mailbox="buyer@mail.ru", folder="INBOX", uid_validity="42", imap_uid=301,
+            campaign_id=campaign_id, recipient_id=recipient_id, message_id="<re@example.ru>",
+            in_reply_to="<one@test>", sender_email="one@example.ru", subject="Re: Запрос",
+            received_at="2999-01-01T10:00:00+00:00", body_text="Ответ поставщика",
+            raw_eml_path="re.eml", match_method="in_reply_to", needs_review=False,
+        )
+        rows = self.db.list_recipient_correspondence(recipient_id)
+        self.assertEqual([row["direction"] for row in rows], ["out", "in"])
+        self.assertEqual(rows[0]["body"], "Текст рассылки")
+        self.assertEqual(rows[1]["body"], "Ответ поставщика")
+
     def test_existing_database_is_migrated_without_losing_incoming(self) -> None:
         old_path = Path(self.temp.name) / "old.db"
         with closing(sqlite3.connect(old_path)) as connection:
