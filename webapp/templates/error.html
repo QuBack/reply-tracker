@@ -1,0 +1,2 @@
+{% extends 'base.html' %}
+{% block content %}<section class="panel error-page"><p class="eyebrow">Не удалось выполнить действие</p><h1>{{ title }}</h1><p>{{ message }}</p><div class="actions"><button type="button" data-back>Вернуться назад</button><a class="button primary" href="{{ url_for('dashboard' if current_user else 'login') }}">{{ 'Рабочий стол' if current_user else 'Войти' }}</a></div></section>{% endblock %}

@@ -1,0 +1,10 @@
+.git
+.dev-data
+__pycache__
+**/__pycache__
+.venv
+.env
+outputs
+*.db
+*.eml
+tests

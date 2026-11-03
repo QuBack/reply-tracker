@@ -1,0 +1,10 @@
+{% extends 'base.html' %}{% from 'macros.html' import token with context %}
+{% block content %}
+<div class="auth-intro"><span class="brand-mark" aria-hidden="true">с.</span><p>Снабжение</p><h1>От запроса<br>до предложения.</h1><p class="auth-description">Поставщики, деловая переписка и счета — в одном рабочем пространстве.</p><div class="auth-rule"></div><p class="muted">Ваши данные доступны только вашему аккаунту.</p></div>
+<section class="auth-card"><h2>{{ 'Создать аккаунт' if registering else 'Вход в пространство' }}</h2><p class="muted">{{ 'Укажите email и придумайте пароль.' if registering else 'Продолжите работу с вашими закупками.' }}</p>
+{% if error %}<div class="notice error" role="alert">{{ error }}</div>{% endif %}
+<form method="post">{{ token() }}<label>Email<input name="email" type="email" autocomplete="username" maxlength="254" required></label><label>Пароль<input name="password" type="password" autocomplete="{{ 'new-password' if registering else 'current-password' }}" {% if registering %}minlength="12"{% endif %} maxlength="256" required></label>
+{% if registering %}<p class="hint">Не менее 12 символов.</p>{% endif %}<button class="primary full" type="submit">{{ 'Создать аккаунт' if registering else 'Войти' }}<span aria-hidden="true">→</span></button></form>
+{% if registering %}<a class="auth-link" href="{{ url_for('login') }}">Уже есть аккаунт? Войти</a>{% elif allow_registration %}<a class="auth-link" href="{{ url_for('register') }}">Создать аккаунт</a>{% else %}<p class="hint">Для получения доступа обратитесь к администратору.</p>{% endif %}
+</section>
+{% endblock %}

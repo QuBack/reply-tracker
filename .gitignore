@@ -7,6 +7,8 @@ build/
 dist/
 *.spec
 .dev-data/
+.env
+secret.key
 
 # Собранные exe, выгрузки и рабочие таблицы
 outputs/

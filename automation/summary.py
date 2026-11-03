@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import csv
+import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from collections import defaultdict
@@ -302,6 +305,29 @@ def _windows_ocr(image_path: Path) -> list[dict[str, object]]:
     return result if isinstance(result, list) else [result]
 
 
+def _tesseract_ocr(image_path: Path) -> list[dict[str, object]]:
+    executable = shutil.which("tesseract")
+    if not executable:
+        raise RuntimeError("Установите Tesseract OCR и языки rus, eng для распознавания сканов")
+    process = subprocess.run(
+        [executable, str(image_path), "stdout", "-l", "rus+eng", "--psm", "11", "tsv"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
+    )
+    if process.returncode:
+        raise RuntimeError("Tesseract OCR не смог распознать страницу")
+    lines: dict[tuple[str, ...], dict[str, object]] = {}
+    for row in csv.DictReader(io.StringIO(process.stdout), delimiter="\t"):
+        text = row.get("text", "").strip()
+        if row.get("level") != "5" or not text:
+            continue
+        key = tuple(row.get(name, "") for name in ("page_num", "block_num", "par_num", "line_num"))
+        if key not in lines:
+            lines[key] = {"text": text, "x": float(row["left"]), "y": float(row["top"])}
+        else:
+            lines[key]["text"] = str(lines[key]["text"]) + " " + text
+    return list(lines.values())
+
+
 def _read_scan_page(path: Path, page_number: int, supplier: str,
                     invoice_number: str) -> tuple[list[InvoiceLine], list[str]]:
     try:
@@ -317,7 +343,7 @@ def _read_scan_page(path: Path, page_number: int, supplier: str,
         image.save(image_path)
         width, height = image.size
         try:
-            blocks = _windows_ocr(image_path)
+            blocks = _windows_ocr(image_path) if os.name == "nt" else _tesseract_ocr(image_path)
         except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
             return [], [f"Скан, стр. {page_number}: требуется распознавание или ручная проверка ({exc})"]
     text = " ".join(str(block.get("text", "")) for block in blocks[:12]).upper()

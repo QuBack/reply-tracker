@@ -1,0 +1,2 @@
+{% extends 'base.html' %}{% from 'macros.html' import campaign_table with context %}
+{% block content %}<div class="page-heading"><div><h1>Рассылки</h1><p class="muted">Запросы цен и ответы поставщиков.</p></div><a class="button primary" href="{{ url_for('new_campaign') }}">+ Новая рассылка</a></div><section class="panel">{{ campaign_table(campaigns) }}</section>{% endblock %}

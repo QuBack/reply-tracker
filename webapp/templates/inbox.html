@@ -1,0 +1,2 @@
+{% extends 'base.html' %}{% from 'macros.html' import token, incoming_table with context %}
+{% block content %}<div class="page-heading"><div><h1>Входящие письма</h1><p class="muted">Ответы поставщиков и письма, которым нужна привязка к рассылке.</p></div><form action="{{ url_for('operation', kind='mail') }}" method="post">{{ token() }}<button class="primary" type="submit">Проверить почту</button></form></div><section class="panel">{{ incoming_table(incoming) }}</section>{% endblock %}

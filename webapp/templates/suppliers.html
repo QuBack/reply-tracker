@@ -1,0 +1,18 @@
+{% extends 'base.html' %}{% from 'macros.html' import token with context %}
+{% block content %}
+<div class="page-heading"><div><h1>Поставщики</h1><p class="muted">Ваша база компаний и контактов.</p></div><a class="button" href="{{ url_for('search') }}">Найти поставщиков <span aria-hidden="true">↗</span></a></div>
+<div class="split-layout"><section class="panel"><div class="panel-heading"><h2>Компании <span class="count">{{ suppliers|length }}</span></h2><form class="inline-search" method="get"><label class="sr-only" for="supplier-q">Поиск по базе</label><input id="supplier-q" name="q" value="{{ request.args.get('q','') }}" placeholder="Компания, email, категория"><button type="submit">Найти</button></form></div>
+{% if suppliers %}<div class="table-scroll"><table><thead><tr><th>Компания</th><th>Контакты</th><th></th></tr></thead><tbody>{% for row in suppliers %}<tr><td><a class="row-title" href="{{ url_for('suppliers', edit=row.id) }}">{{ row.name }}</a><small>{{ row.categories or 'Без категории' }}</small>{% if row.excluded %}<span class="badge failed">Исключён из рассылок</span>{% endif %}</td><td>{{ row.email or 'Без email' }}{% for phone in row.phones_json|json_list %}<small>{{ phone }}</small>{% endfor %}</td><td><a href="{{ url_for('suppliers', edit=row.id) }}">Изменить</a></td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="empty"><h3>{{ 'Ничего не найдено' if request.args.get('q') else 'Добавьте первого поставщика' }}</h3><p>Заполните карточку справа или воспользуйтесь поиском компаний.</p></div>{% endif %}</section>
+<section class="panel form-panel"><div class="panel-heading"><h2>{{ 'Карточка поставщика' if edit else 'Новый поставщик' }}</h2>{% if edit %}<a href="{{ url_for('suppliers') }}">Новый</a>{% endif %}</div><form action="{{ url_for('save_supplier') }}" method="post" class="padded">{{ token() }}<input name="id" type="hidden" value="{{ edit.id if edit else '' }}">
+<label>Название компании<input name="name" value="{{ edit.name if edit else '' }}" maxlength="200" required></label>
+<label>Email<input type="email" name="email" value="{{ (edit.email or '') if edit else '' }}"></label>
+<label>Телефоны<textarea name="phones" rows="2" placeholder="Каждый номер с новой строки">{{ (edit.phones_json|json_list)|join('\n') if edit else '' }}</textarea></label>
+<p class="hint">Для карточки достаточно email или телефона.</p>
+<label>Сайт<input type="url" name="website" placeholder="https://company.ru" value="{{ edit.website if edit else '' }}"></label>
+<label>Контактное лицо<input name="contact_person" value="{{ edit.contact_person if edit else '' }}"></label>
+<label>Категории<input name="categories" value="{{ edit.categories if edit else '' }}" placeholder="Металлопрокат, крепёж"></label>
+<label>Заметки<textarea name="notes" rows="2">{{ edit.notes if edit else '' }}</textarea></label>
+<label class="check"><input type="checkbox" name="excluded" value="1" {% if edit and edit.excluded %}checked{% endif %}> Исключить из рассылок</label>
+<label>Причина исключения<input name="excluded_reason" value="{{ edit.excluded_reason if edit else '' }}"></label><button class="primary full" type="submit">Сохранить поставщика</button></form>
+{% if edit %}<form class="padded border-top" action="{{ url_for('delete_supplier', supplier_id=edit.id) }}" method="post" data-confirm="Удалить поставщика? Компанию с историей рассылок удалить нельзя.">{{ token() }}<button class="danger full" type="submit">Удалить поставщика</button></form>{% endif %}</section></div>
+{% endblock %}

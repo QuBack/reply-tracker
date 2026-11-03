@@ -1,0 +1,33 @@
+services:
+  web:
+    build:
+      context: .
+      target: web
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - app-data:/data
+    environment:
+      WEB_TRUSTED_HOSTS: ${WEB_TRUSTED_HOSTS:-localhost,127.0.0.1}
+      WEB_SECURE_COOKIES: ${WEB_SECURE_COOKIES:-0}
+      WEB_ALLOW_REGISTRATION: ${WEB_ALLOW_REGISTRATION:-0}
+      WEB_TRUSTED_PROXY: ${WEB_TRUSTED_PROXY:-}
+      CODEX_SEARCH_URL: http://search:8090/search
+      CODEX_GATEWAY_TOKEN: ${CODEX_GATEWAY_TOKEN:?Set CODEX_GATEWAY_TOKEN in .env}
+    restart: unless-stopped
+    init: true
+    depends_on:
+      - search
+  search:
+    build:
+      context: .
+      target: search
+    volumes:
+      - codex-auth:/codex
+    environment:
+      CODEX_GATEWAY_TOKEN: ${CODEX_GATEWAY_TOKEN:?Set CODEX_GATEWAY_TOKEN in .env}
+    restart: unless-stopped
+    init: true
+volumes:
+  app-data:
+  codex-auth:
