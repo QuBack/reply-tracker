@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .app import create_app
 from .store import Store
+from .config import load_environment
 
 
 def acquire_server_lock(root: Path):
@@ -30,13 +31,23 @@ def acquire_server_lock(root: Path):
 
 
 def main():
+    load_environment()
     parser = argparse.ArgumentParser(description="Снабжение: веб-приложение")
-    parser.add_argument("command", choices=["serve", "create-user", "reset-password", "import-desktop"])
+    parser.add_argument("command", choices=["serve", "create-user", "reset-password", "import-desktop", "seed-demo"])
     parser.add_argument("--email")
     parser.add_argument("--source", type=Path)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
+    if args.command == "seed-demo":
+        from .demo_data import seed_demo
+        root = Path(os.environ.get("WEB_DATA_DIR", str(Path(__file__).resolve().parents[1] / ".dev-data" / "web")))
+        try:
+            result = seed_demo(Store(root), args.email or "demo@example.test")
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(result)
+        return
     if args.command == "import-desktop":
         if not args.email or not args.source:
             parser.error("Укажите --email и --source. Сервер и настольная программа должны быть остановлены.")

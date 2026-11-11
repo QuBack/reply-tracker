@@ -741,13 +741,13 @@ class AppService:
     def assign_incoming(self, incoming_id: int, recipient_id: int) -> None:
         self.db.assign_incoming(incoming_id, recipient_id)
 
-    def create_summary(self, campaign_id: int, request_path: Path | None = None) -> OperationResult:
+    def create_summary(self, campaign_id: int, request_path: Path | None = None, *, allow_partial: bool = False) -> OperationResult:
         from .summary import OfferSource, build_summary
 
         campaign = self.db.get_campaign(campaign_id)
         if campaign is None:
             raise ValueError("Рассылка не найдена")
-        if campaign["status"] not in ("ready", "closed"):
+        if campaign["status"] not in ("ready", "closed") and not (allow_partial and campaign["status"] == "active"):
             raise ValueError("Дождитесь ответов или завершите ожидание адресатов")
         if request_path is None:
             stored = campaign["request_path"]

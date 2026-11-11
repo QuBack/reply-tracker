@@ -12,20 +12,23 @@ services:
       WEB_SECURE_COOKIES: ${WEB_SECURE_COOKIES:-0}
       WEB_ALLOW_REGISTRATION: ${WEB_ALLOW_REGISTRATION:-0}
       WEB_TRUSTED_PROXY: ${WEB_TRUSTED_PROXY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-${chatgpt_api:-}}
+      SEARCH_PROVIDER: ${SEARCH_PROVIDER:-openai}
+      OPENAI_SEARCH_MODEL: ${OPENAI_SEARCH_MODEL:-gpt-6-luna}
+      OPENAI_SEARCH_BUDGET_USD: ${OPENAI_SEARCH_BUDGET_USD:-5}
       CODEX_SEARCH_URL: http://search:8090/search
-      CODEX_GATEWAY_TOKEN: ${CODEX_GATEWAY_TOKEN:?Set CODEX_GATEWAY_TOKEN in .env}
+      CODEX_GATEWAY_TOKEN: ${CODEX_GATEWAY_TOKEN:-}
     restart: unless-stopped
     init: true
-    depends_on:
-      - search
   search:
+    profiles: [codex]
     build:
       context: .
       target: search
     volumes:
       - codex-auth:/codex
     environment:
-      CODEX_GATEWAY_TOKEN: ${CODEX_GATEWAY_TOKEN:?Set CODEX_GATEWAY_TOKEN in .env}
+      CODEX_GATEWAY_TOKEN: ${CODEX_GATEWAY_TOKEN:-}
     restart: unless-stopped
     init: true
 volumes:

@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import uuid
+from decimal import Decimal
 from urllib.request import Request, urlopen
 from pathlib import Path
 
@@ -13,6 +14,9 @@ from automation.database import Database
 from automation.paths import AppPaths
 from automation.service import AppService
 from automation.supplier_search import parse_codex_result, run_codex_search
+from automation.openai_search import (OpenAISearchError, RESERVATION_CENTS, request_search,
+                                      response_usage, parse_search_response)
+from .config import search_provider
 from .store import EncryptedCredentials, Store
 
 LOG = logging.getLogger(__name__)
@@ -73,7 +77,19 @@ class Runtime:
             service = self.service(user_id)
             if kind == "search":
                 gateway = os.environ.get("CODEX_SEARCH_URL", "")
-                if gateway:
+                details = {}
+                if search_provider() == "openai":
+                    limit = int(Decimal(os.environ.get("OPENAI_SEARCH_BUDGET_USD", "5")) * 100)
+                    if not self.store.reserve_search(job["id"], user_id, limit, RESERVATION_CENTS):
+                        raise OpenAISearchError("Достигнут общий лимит расходов на поиск. Обратитесь к администратору.")
+                    response = request_search(payload["query"], payload["region"], service.db.list_categories(), payload["count"])
+                    usage = response_usage(response)
+                    if usage:
+                        self.store.settle_search(job["id"], usage)
+                        details = {"model": "gpt-6-luna", "estimated_cost_usd": f"{usage.estimated_cents / 100:.2f}",
+                                   "web_search_calls": usage.searches}
+                    result = parse_search_response(response, payload["count"])
+                elif gateway:
                     body = json.dumps({**payload, "categories": service.db.list_categories()[:100]}).encode()
                     request = Request(gateway, data=body, headers={"Content-Type": "application/json",
                         "Authorization": "Bearer " + os.environ.get("CODEX_GATEWAY_TOKEN", "")})
@@ -91,7 +107,9 @@ class Runtime:
                 else:
                     raise RuntimeError("Configure CODEX_SEARCH_URL and CODEX_GATEWAY_TOKEN")
                 added, updated = service.db.import_candidates(payload["query"], payload["region"], result.candidates)
-                message, details = f"Поиск завершён. Добавлено: {added}, обновлено: {updated}.", {}
+                message = f"Поиск завершён. Добавлено: {added}, обновлено: {updated}."
+                if details:
+                    message += f" Оценка расходов: ${details['estimated_cost_usd']}."
             else:
                 if kind == "send":
                     campaign = service.db.get_campaign(payload["campaign_id"])
@@ -108,17 +126,22 @@ class Runtime:
                     result = service.send_reply(draft, body=payload["body"], subject=payload["subject"],
                         attachment_paths=[str(self.file(user_id, value)[0]) for value in payload["files"]])
                 elif kind == "summary":
-                    result = service.create_summary(payload["campaign_id"])
+                    result = service.create_summary(payload["campaign_id"], allow_partial=True)
                 elif kind == "backup":
                     result = service.create_backup()
                 else:
                     raise ValueError("Неизвестная операция")
                 message, details = result.message, dict(result.details)
+                if kind == "summary":
+                    details["campaign_id"] = payload["campaign_id"]
                 if "path" in details:
                     details["file_id"] = self.register_file(user_id, Path(str(details.pop("path"))))
                     # Never expose internal paths in job messages.
                     message = "Файл готов к скачиванию."
             self.store.finish(job["id"], "done", message, details)
+        except OpenAISearchError as exc:
+            # These deliberately sanitized messages explain billing/auth failures.
+            self.store.finish(job["id"], "failed", str(exc))
         except Exception:
             # Exceptions may include SMTP credentials, subprocess stderr, or file paths.
             # Keep the browser response generic; diagnose using the server-side log.
@@ -171,7 +194,7 @@ class Runtime:
                 except Exception:
                     LOG.exception("Mail scheduler failed")
                 self.stop.wait(30)
-        for target, args, name in [(work, (True,), "codex"), (work, (False,), "mail"),
+        for target, args, name in [(work, (True,), "search"), (work, (False,), "mail"),
                                     (schedule, (), "scheduler")]:
             thread = threading.Thread(target=target, args=args, name=name, daemon=True)
             self.threads.append(thread)

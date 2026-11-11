@@ -1,2 +1,11 @@
-{% extends 'base.html' %}{% from 'macros.html' import campaign_table with context %}
-{% block content %}<div class="page-heading"><div><h1>Рассылки</h1><p class="muted">Запросы цен и ответы поставщиков.</p></div><a class="button primary" href="{{ url_for('new_campaign') }}">+ Новая рассылка</a></div><section class="panel">{{ campaign_table(campaigns) }}</section>{% endblock %}
+{% extends 'base.html' %}
+{% from 'macros.html' import campaign_table with context %}
+{% block content %}
+<div class="page-heading"><h1>Закупки</h1><a class="button primary" href="{{ url_for('new_campaign') }}">+ Новая закупка</a></div>
+{% if unread_count %}<div class="mail-notice"><svg aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#mail"></use></svg><strong>Непрочитанные письма <span class="notice-count">{{ unread_count }}</span></strong><a href="{{ url_for('inbox', filter='unread') }}">Посмотреть письма</a></div>{% endif %}
+<div class="purchase-toolbar">
+  <form class="purchase-search" action="{{ url_for('campaigns') }}" method="get"><label class="sr-only" for="purchase-q">Найти закупку</label><input id="purchase-q" name="q" value="{{ query }}" placeholder="Найти закупку" maxlength="200"><input type="hidden" name="status" value="{{ selected_filter }}"><button type="submit">Найти</button></form>
+  <nav class="filter-tabs" aria-label="Статус закупки">{% for key, label in purchase_filters %}<a class="filter-tab {{ 'selected' if selected_filter == key }}" href="{{ url_for('campaigns', status=key, q=query) }}" {% if selected_filter == key %}aria-current="page"{% endif %}>{{ label }}{% if filter_counts[key] %}<span>{{ filter_counts[key] }}</span>{% endif %}</a>{% endfor %}</nav>
+</div>
+<section class="panel purchases-panel">{% if campaigns %}{{ campaign_table(campaigns) }}{% elif query or selected_filter != 'all' %}<div class="empty"><h3>Закупки не найдены</h3><p>Измените запрос или выберите другой фильтр.</p><a class="button" href="{{ url_for('campaigns') }}">Показать все закупки</a></div>{% else %}{{ campaign_table(campaigns) }}{% endif %}</section>
+{% endblock %}

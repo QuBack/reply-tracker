@@ -11,11 +11,12 @@
 <a class="skip" href="#main">К содержимому</a>
 {% if current_user %}
 <aside class="sidebar">
-  <a class="brand" href="{{ url_for('dashboard') }}"><span class="brand-mark" aria-hidden="true">с.</span><span>Снабжение<small>Рабочее пространство</small></span></a>
+  <a class="brand" href="{{ url_for('dashboard') }}"><span class="brand-mark" aria-hidden="true">с.</span><span>Снабжение</span></a>
   <nav aria-label="Основная навигация">
-  {% for endpoint, label, glyph in [('dashboard','Рабочий стол','grid'),('campaigns','Рассылки','mail'),('inbox','Входящие','inbox'),('suppliers','Поставщики','building'),('search','Поиск поставщиков','search'),('jobs','Задачи','clock')] %}
+  {% for endpoint, label, glyph in [('campaigns','Закупки','cart'),('inbox','Письма','mail'),('suppliers','Поставщики','building')] %}
     <a class="nav-item {{ 'active' if section == endpoint }}" href="{{ url_for(endpoint) }}" {% if section == endpoint %}aria-current="page"{% endif %}>
       <svg aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#{{ glyph }}"></use></svg>{{ label }}
+      {% if endpoint == 'inbox' and unread_count %}<span class="nav-count" aria-label="Непрочитанных писем: {{ unread_count }}">{{ unread_count }}</span>{% endif %}
     </a>
   {% endfor %}
   </nav>
@@ -25,8 +26,13 @@
 </aside>
 {% endif %}
 <main id="main" class="{{ 'workspace' if current_user else 'auth-workspace' }}">
-{% if current_user %}<header class="topbar"><span>Личное рабочее пространство</span><span class="topbar-date">Поставщики. Письма. Предложения.</span></header>{% endif %}
 <div class="{{ 'content' if current_user else 'auth-content' }}">
+{% if current_operation %}
+<section class="operation-notice {{ 'error' if current_operation.state == 'failed' }}" role="status" aria-live="polite" data-operation-id="{{ current_operation.id }}" data-operation-state="{{ current_operation.state }}">
+  <div><strong>{{ job_labels.get(current_operation.kind, 'Операция') }}</strong><p>{{ current_operation.message or ('Запрос принят. Можно продолжить работу.' if current_operation.state == 'queued' else 'Выполняется. Результат появится здесь автоматически.') }}</p></div>
+  {% if current_operation.result.file_id %}<a class="button primary" href="{{ url_for('download', file_id=current_operation.result.file_id) }}">Скачать файл</a>{% elif current_operation.state in ['queued','running'] %}<span class="badge running">Выполняется</span>{% endif %}
+</section>
+{% endif %}
 {% block content %}{% endblock %}
 </div>
 </main>

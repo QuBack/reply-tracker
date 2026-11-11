@@ -1,4 +1,35 @@
-{% extends 'base.html' %}{% from 'macros.html' import token with context %}
-{% block content %}<a class="back-link" href="{{ url_for('campaigns') }}">← Все рассылки</a><div class="page-heading"><div><h1>Новая рассылка</h1><p class="muted">Подготовьте запрос. Перед отправкой вы сможете проверить черновик.</p></div></div>
-<form action="{{ url_for('new_campaign') }}" method="post" enctype="multipart/form-data">{{ token() }}<div class="split-layout"><section class="panel padded"><h2>Запрос поставщикам</h2><label>Название закупки<input name="name" required maxlength="200" placeholder="Металлопрокат для объекта"></label><label>Тема письма<input name="subject" required maxlength="500" placeholder="Запрос коммерческого предложения"></label><label>Текст письма<textarea name="body" rows="9" maxlength="50000" required placeholder="Добрый день! Просим направить предложение по приложенной заявке, указать сроки поставки и условия оплаты."></textarea></label><label>Срок ответа<input type="date" name="deadline"></label><div class="upload-zone"><label>Исходная заявка XLSX<input type="file" name="request" accept=".xlsx"></label><p class="hint">Используется при построении сводной и прикладывается к письму.</p><label>Другие вложения<input type="file" name="attachments" multiple accept=".pdf,.xlsx,.xls,.doc,.docx,.txt,.csv,.png,.jpg,.jpeg"></label><p class="hint">Общий размер загрузки — до 25 МБ.</p></div></section>
-<section class="panel padded"><h2>Получатели</h2><p class="muted">Выберите компании из своей базы.</p><div class="recipient-picker">{% for row in suppliers %}<label class="recipient-option {{ 'disabled' if row.excluded or not row.email }}"><input type="checkbox" name="suppliers" value="{{ row.id }}" {% if row.excluded or not row.email %}disabled{% endif %}><span><strong>{{ row.name }}</strong><small>{{ 'Исключён из рассылок' if row.excluded else row.email or 'Не указан email' }}</small></span></label>{% else %}<p>Сначала <a href="{{ url_for('suppliers') }}">добавьте поставщиков</a>.</p>{% endfor %}</div><button class="primary full" type="submit">Сохранить черновик</button></section></div></form>{% endblock %}
+{% extends 'base.html' %}
+{% from 'macros.html' import token with context %}
+{% block content %}
+<a class="back-link" href="{{ url_for('campaigns') }}">← Закупки</a>
+<div class="page-heading"><h1>{{ 'Черновик закупки' if draft else 'Новая закупка' }}</h1></div>
+<form class="purchase-wizard" action="{{ url_for('edit_campaign', campaign_id=draft.id) if draft else url_for('new_campaign') }}" method="post" enctype="multipart/form-data" data-purchase-wizard>
+{{ token() }}
+<ol class="purchase-steps" aria-label="Этапы закупки"><li data-step-indicator><span>1</span>Заявка</li><li data-step-indicator><span>2</span>Поставщики</li><li data-step-indicator><span>3</span>Отправка</li><li><span>4</span>Предложения</li></ol>
+<div class="notice error" role="alert" data-wizard-error hidden></div>
+<fieldset class="panel wizard-panel" data-wizard-step>
+<legend>Что нужно закупить</legend>
+<div class="wizard-fields"><label>Название закупки<input name="name" value="{{ draft.name if draft else '' }}" required maxlength="200" placeholder="Например, металлопрокат для склада"></label><label>Срок ответа<input name="deadline" type="date" value="{{ draft.deadline or '' if draft else '' }}"></label></div>
+<label>Заявка в Excel<input type="file" name="request" accept=".xlsx"></label><p class="hint">Заявка прикладывается к письму и используется для сравнения предложений.</p>
+{% if existing_files %}<p class="hint">Уже прикреплены: {% for file in existing_files %}{{ file.filename }}{{ ', ' if not loop.last }}{% endfor %}</p>{% endif %}
+<details class="additional-fields"><summary>Текст письма и дополнительные файлы</summary><label>Тема письма<input name="subject" value="{{ draft.subject if draft else 'Запрос коммерческого предложения' }}" required maxlength="500"></label><label>Текст письма<textarea name="body" rows="6" maxlength="50000" required>{{ draft.body if draft else 'Добрый день!
+
+Просим направить коммерческое предложение по приложенной заявке. Укажите цены с НДС, сроки поставки и условия оплаты.
+
+Спасибо!' }}</textarea></label><label>Дополнительные файлы<input type="file" name="attachments" multiple accept=".pdf,.xlsx,.xls,.doc,.docx,.txt,.csv,.png,.jpg,.jpeg"></label><p class="hint">Общий размер файлов — до 25 МБ.</p></details>
+</fieldset>
+<fieldset class="panel wizard-panel" data-wizard-step>
+<legend>Кому отправить запрос</legend>
+<div class="picker-tools"><label class="sr-only" for="picker-search">Найти поставщика</label><input id="picker-search" type="search" placeholder="Найти поставщика" data-picker-search><span role="status" aria-live="polite" data-picker-count>Выбрано: {{ selected_suppliers|length }}</span></div>
+<div class="recipient-picker">{% for row in suppliers %}<label class="recipient-option {{ 'disabled' if row.excluded or not row.email }}" data-picker-option><input type="checkbox" name="suppliers" value="{{ row.id }}" data-supplier-name="{{ row.name }}" {% if row.id in selected_suppliers %}checked{% endif %} {% if row.excluded or not row.email %}disabled{% endif %}><span><strong>{{ row.name }}</strong><small>{{ 'Исключён из закупок' if row.excluded else row.email or 'Не указан email' }}</small></span></label>{% else %}<p>В базе пока нет компаний. <a href="{{ url_for('suppliers') }}">Добавить поставщиков</a></p>{% endfor %}</div>
+<p class="hint">Не хватает компаний? <a href="{{ url_for('search') }}" target="_blank" rel="noopener">Найти новых поставщиков</a></p>
+</fieldset>
+<fieldset class="panel wizard-panel" data-wizard-step>
+<legend>Проверьте перед отправкой</legend>
+<dl class="review-list"><dt>Закупка</dt><dd data-review-name></dd><dt>Срок ответа</dt><dd data-review-deadline></dd><dt>Поставщики</dt><dd data-review-suppliers></dd><dt>Файлы</dt><dd data-review-files data-existing-files="{{ existing_files|map(attribute='filename')|join(', ') }}"></dd><dt>Тема письма</dt><dd data-review-subject></dd></dl>
+<details><summary>Посмотреть текст письма</summary><div class="letter-body" data-review-body></div></details>
+<p class="hint">Закупка сохранится как черновик. Отправка писем — отдельной кнопкой после сохранения.</p>
+</fieldset>
+<div class="wizard-actions"><button type="button" data-wizard-back hidden>Назад</button><a class="button quiet" href="{{ url_for('campaigns') }}" data-wizard-cancel>Отмена</a><button class="primary" type="button" data-wizard-next hidden>Далее: поставщики</button><button class="primary" type="submit" data-wizard-save>Сохранить и перейти к отправке</button></div>
+</form>
+{% endblock %}

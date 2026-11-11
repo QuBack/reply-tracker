@@ -19,13 +19,15 @@ from automation.service import safe_name, sha256_file
 from automation.supplier_search import clean_phones, export_candidates_xlsx, normalize_email, normalize_web_url
 from .runtime import Runtime
 from .store import Store
+from .config import search_limit
+from .purchases import FILTERS, filtered_purchases, purchase_rows
 
-CAMPAIGN_LABELS = {"draft": "Черновик", "active": "Ожидаем ответы", "ready": "Готово к сводной", "closed": "Завершена"}
+CAMPAIGN_LABELS = {"draft": "Черновик", "active": "Ждём ответы", "ready": "Можно сравнить", "closed": "Завершена"}
 RECIPIENT_LABELS = {"pending": "Не отправлено", "sent": "Ожидаем ответ", "reply_without_files": "Ответ без файлов",
     "files_received": "Файлы получены", "declined": "Отказ", "closed_no_response": "Закрыт без ответа",
     "send_failed": "Ошибка отправки", "send_unknown": "Исход неизвестен"}
-JOB_LABELS = {"search": "Поиск поставщиков", "send": "Отправка рассылки", "mail": "Проверка почты",
-    "test_mail": "Проверка подключения", "reply": "Ответ поставщику", "summary": "Создание сводной", "backup": "Резервная копия"}
+JOB_LABELS = {"search": "Поиск поставщиков", "send": "Отправка запроса", "mail": "Проверка почты",
+    "test_mail": "Проверка подключения", "reply": "Ответ поставщику", "summary": "Сравнение предложений", "backup": "Резервная копия"}
 STATE_LABELS = {"queued": "В очереди", "running": "Выполняется", "done": "Готово", "failed": "Требует внимания"}
 
 
@@ -78,7 +80,18 @@ def create_app(config: dict | None = None) -> Flask:
     @app.context_processor
     def template_context():
         session.setdefault("csrf", secrets.token_urlsafe(32))
+        unread_count, current_operation = 0, None
+        if g.get("user") and g.get("db"):
+            with g.db.connect() as connection:
+                unread_count = connection.execute("SELECT COUNT(*) FROM incoming_messages WHERE opened_at IS NULL").fetchone()[0]
+            operation_id = request.args.get("operation")
+            if operation_id:
+                row = next((row for row in store.jobs(g.user["id"]) if row["id"] == operation_id), None)
+                if row:
+                    current_operation = dict(row)
+                    current_operation["result"] = json.loads(row["result"])
         return dict(csrf=session["csrf"], current_user=g.get("user"),
+                    unread_count=unread_count, current_operation=current_operation,
                     campaign_labels=CAMPAIGN_LABELS, recipient_labels=RECIPIENT_LABELS,
                     job_labels=JOB_LABELS, state_labels=STATE_LABELS,
                     allow_registration=app.config["ALLOW_REGISTRATION"])
@@ -111,8 +124,14 @@ def create_app(config: dict | None = None) -> Flask:
         return row
 
     def enqueue(kind, payload):
-        store.enqueue(g.user["id"], kind, payload)
-        return redirect(url_for("jobs"), code=303)
+        operation_id = store.enqueue(g.user["id"], kind, payload)
+        if kind in {"send", "summary"}:
+            target = url_for("campaign", campaign_id=payload["campaign_id"], operation=operation_id)
+        elif kind == "reply":
+            target = url_for("thread", recipient_id=payload["recipient_id"], operation=operation_id)
+        else:
+            target = url_for({"search": "search", "mail": "inbox", "test_mail": "settings", "backup": "settings"}[kind], operation=operation_id)
+        return redirect(target, code=303)
 
     def uploaded(field="attachments"):
         files = []
@@ -179,8 +198,16 @@ def create_app(config: dict | None = None) -> Flask:
 
     @app.get("/")
     def dashboard():
-        return page("dashboard.html", "Рабочий стол", "dashboard", stats=g.db.dashboard_stats(),
-                    campaigns=g.db.list_campaigns()[:6], recent_jobs=store.jobs(g.user["id"])[:5])
+        return purchases_page()
+
+    def purchases_page():
+        status = request.args.get("status", "all")
+        if status not in dict(FILTERS):
+            status = "all"
+        query = request.args.get("q", "").strip()[:200]
+        rows, counts = filtered_purchases(g.db, query, status)
+        return page("campaigns.html", "Закупки", "campaigns", campaigns=rows,
+                    purchase_filters=FILTERS, filter_counts=counts, selected_filter=status, query=query)
 
     @app.get("/suppliers")
     def suppliers():
@@ -215,15 +242,17 @@ def create_app(config: dict | None = None) -> Flask:
 
     @app.get("/search")
     def search():
-        return page("search.html", "Поиск поставщиков", "search", candidates=g.db.list_candidates(),
+        return page("search.html", "Найти компании", "suppliers", candidates=g.db.list_candidates(),
+                    search_limit=search_limit(),
                     searches=[row for row in store.jobs(g.user["id"]) if row["kind"] == "search"][:3])
 
     @app.post("/search")
     def start_search():
         query, region = request.form.get("query", "").strip(), request.form.get("region", "").strip()
         count = int(request.form.get("count", "10"))
-        if not 5 <= len(query) <= 600 or len(region) > 150 or not 1 <= count <= 50:
-            raise ValueError("Запрос: 5–600 символов, регион: до 150, количество: 1–50 компаний")
+        limit = search_limit()
+        if not 5 <= len(query) <= 600 or len(region) > 150 or not 1 <= count <= limit:
+            raise ValueError(f"Запрос: 5–600 символов, регион: до 150, количество: 1–{limit} компаний")
         return enqueue("search", dict(query=query, region=region, count=count))
 
     @app.post("/candidates/<int:candidate_id>/<action>")
@@ -246,10 +275,25 @@ def create_app(config: dict | None = None) -> Flask:
 
     @app.get("/campaigns")
     def campaigns():
-        return page("campaigns.html", "Рассылки", "campaigns", campaigns=g.db.list_campaigns())
+        return purchases_page()
 
     @app.route("/campaigns/new", methods=["GET", "POST"])
     def new_campaign():
+        return purchase_form()
+
+    @app.route("/campaigns/<int:campaign_id>/edit", methods=["GET", "POST"])
+    def edit_campaign(campaign_id):
+        return purchase_form(campaign_id)
+
+    def purchase_form(campaign_id=None):
+        draft = required(g.db.get_campaign(campaign_id)) if campaign_id else None
+        if draft:
+            with store.connect() as connection:
+                sending = connection.execute("SELECT 1 FROM jobs WHERE user_id=? AND kind='send' "
+                    "AND state IN ('queued','running') AND json_extract(payload,'$.campaign_id')=?",
+                    (g.user["id"], campaign_id)).fetchone()
+            if draft["status"] != "draft" or sending:
+                raise ValueError("Изменить можно только черновик до отправки запроса")
         if request.method == "POST":
             name, subject, body = (request.form.get(k, "").strip() for k in ("name", "subject", "body"))
             if not name or not subject or not body:
@@ -261,7 +305,25 @@ def create_app(config: dict | None = None) -> Flask:
             requests = uploaded("request")
             if requests and requests[0][1].suffix.lower() != ".xlsx":
                 raise ValueError("Исходная заявка должна быть в формате XLSX")
-            campaign_id = g.db.create_campaign(name, subject, body, deadline, request.form.getlist("suppliers"))
+            supplier_ids = list(dict.fromkeys(int(value) for value in request.form.getlist("suppliers")))
+            if not draft:
+                campaign_id = g.db.create_campaign(name, subject, body, deadline, supplier_ids)
+            else:
+                allowed = {row["id"]: row for row in g.db.list_suppliers() if row["email"] and not row["excluded"]}
+                if not supplier_ids or any(value not in allowed for value in supplier_ids):
+                    raise ValueError("Выберите поставщиков с email из своей базы")
+                with g.db.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    current = connection.execute("SELECT status FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+                    history = connection.execute("SELECT 1 FROM outgoing_messages WHERE campaign_id=? "
+                        "UNION ALL SELECT 1 FROM incoming_messages WHERE campaign_id=? LIMIT 1", (campaign_id, campaign_id)).fetchone()
+                    if current["status"] != "draft" or history:
+                        raise ValueError("В закупке уже есть переписка. Изменение черновика недоступно.")
+                    connection.execute("UPDATE campaigns SET name=?,subject=?,body=?,deadline=? WHERE id=?",
+                                       (name, subject, body, deadline, campaign_id))
+                    connection.execute("DELETE FROM campaign_recipients WHERE campaign_id=?", (campaign_id,))
+                    connection.executemany("INSERT INTO campaign_recipients(campaign_id,supplier_id,email) VALUES(?,?,?)",
+                                           [(campaign_id, value, allowed[value]["email"]) for value in supplier_ids])
             campaign = g.db.get_campaign(campaign_id)
             destination = g.service.paths.campaigns / campaign["code"] / "outgoing" / "attachments"
             destination.mkdir(parents=True, exist_ok=True)
@@ -272,12 +334,23 @@ def create_app(config: dict | None = None) -> Flask:
                 if requests and path == requests[0][1]:
                     g.db.set_campaign_request_path(campaign_id, str(target))
             return redirect(url_for("campaign", campaign_id=campaign_id), code=303)
-        return page("compose.html", "Новая рассылка", "campaigns", suppliers=g.db.list_suppliers())
+        selected_suppliers = {row["supplier_id"] for row in g.db.list_recipients(campaign_id)} if draft else set()
+        return page("compose.html", "Черновик закупки" if draft else "Новая закупка", "campaigns",
+                    suppliers=g.db.list_suppliers(), draft=draft, selected_suppliers=selected_suppliers,
+                    existing_files=g.db.list_outgoing_attachments(campaign_id) if draft else [])
 
     @app.get("/campaigns/<int:campaign_id>")
     def campaign(campaign_id):
         row = required(g.db.get_campaign(campaign_id))
+        summary = next(item for item in purchase_rows(g.db) if item["id"] == campaign_id)
+        completed_files = []
+        for job in store.jobs(g.user["id"]):
+            if job["kind"] == "summary" and job["state"] == "done":
+                result = json.loads(job["result"])
+                if result.get("campaign_id") == campaign_id and result.get("file_id"):
+                    completed_files.append({"name": "Скачать сравнение в Excel", "url": url_for("download", file_id=result["file_id"])})
         return page("campaign.html", row["name"], "campaigns", campaign=row,
+            purchase_summary=summary, completed_files=completed_files,
             recipients=g.db.list_recipients(campaign_id), incoming=g.db.list_incoming(campaign_id=campaign_id),
             attachments=[file_link(r["path"], r["filename"]) for r in g.db.list_outgoing_attachments(campaign_id)],
             suppliers=g.db.list_suppliers())
@@ -290,6 +363,9 @@ def create_app(config: dict | None = None) -> Flask:
                 if row["status"] == "closed":
                     raise ValueError("Рассылка завершена")
                 g.service.mail_settings()
+            else:
+                if not g.db.list_selected_offer_attachments(campaign_id):
+                    raise ValueError("Пока нет предложений с файлами для сравнения")
             return enqueue(action, {"campaign_id": campaign_id})
         if action == "close":
             g.db.set_campaign_closed(campaign_id)
@@ -324,7 +400,8 @@ def create_app(config: dict | None = None) -> Flask:
                 else:
                     item["files"] = [file_link(p) for p in json.loads(outgoing["attachments_json"])]
             letters.append(item)
-        draft = g.service.prepare_reply(recipient_id=recipient_id) if letters else None
+        can_reply = any(letter["direction"] == "in" or letter["delivery_status"] != "failed" for letter in letters)
+        draft = g.service.prepare_reply(recipient_id=recipient_id) if can_reply else None
         return page("thread.html", recipient["supplier_name"], "campaigns", recipient=recipient,
                     letters=letters, draft=draft)
 
@@ -346,7 +423,15 @@ def create_app(config: dict | None = None) -> Flask:
 
     @app.get("/inbox")
     def inbox():
-        return page("inbox.html", "Входящие письма", "inbox", incoming=g.db.list_incoming())
+        rows = g.db.list_incoming()
+        selected = request.args.get("filter", "all")
+        if selected == "unread":
+            rows = [row for row in rows if not row["opened_at"]]
+        elif selected == "review":
+            rows = [row for row in rows if row["needs_review"] or not row["recipient_id"]]
+        else:
+            selected = "all"
+        return page("inbox.html", "Письма", "inbox", incoming=rows, mail_filter=selected)
 
     @app.get("/inbox/<int:incoming_id>")
     def incoming_message(incoming_id):

@@ -157,6 +157,17 @@ class WebTests(unittest.TestCase):
         self.assertEqual(len(self.store.jobs(self.alice_id)), 1)
         self.assertEqual(self.bob.get("/api/jobs").json, [])
 
+    def test_failed_initial_letter_still_opens_correspondence(self):
+        self.campaign(self.alice)
+        service = self.runtime.service(self.alice_id)
+        service.db.record_outgoing(1, 1, "<failed@example.test>", "Prices", "unused.eml")
+        with service.db.connect() as db:
+            db.execute("UPDATE outgoing_messages SET delivery_status='failed' WHERE recipient_id=1")
+            db.execute("UPDATE campaign_recipients SET status='send_failed' WHERE id=1")
+        response = self.alice.get("/recipients/1")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(b'action="/recipients/1/reply"', response.data)
+
     def test_search_worker_imports_results_only_for_owner(self):
         response = self.post(self.alice, "/search", {"query": "steel suppliers", "region": "Moscow", "count": "5"})
         self.assertEqual(response.status_code, 303)
@@ -245,6 +256,82 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.post(other, "/login", {"email": "missing@example.com", "password": "bad"}).status_code, 429)
         self.app.config["ALLOW_REGISTRATION"] = False
         self.assertEqual(other.get("/register").status_code, 404)
+
+    def test_draft_can_be_resumed_without_losing_files_or_changing_id(self):
+        location = self.campaign(self.alice)
+        service = self.runtime.service(self.alice_id)
+        original_path = service.db.get_campaign(1)["request_path"]
+        self.assertEqual(self.alice.get(location + "/edit").status_code, 200)
+        response = self.post(self.alice, location + "/edit", {"name": "Updated purchase", "subject": "New subject",
+            "body": "Updated letter", "suppliers": "1"})
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["Location"], location)
+        self.assertEqual(service.db.get_campaign(1)["name"], "Updated purchase")
+        self.assertEqual(service.db.get_campaign(1)["request_path"], original_path)
+        self.assertTrue(Path(original_path).is_file())
+        self.assertEqual(len(service.db.list_campaigns()), 1)
+        self.assertEqual(self.bob.get(location + "/edit").status_code, 404)
+        self.store.enqueue(self.alice_id, "send", {"campaign_id": 1})
+        self.assertEqual(self.post(self.alice, location + "/edit", {"name": "Unsafe edit"}).status_code, 400)
+        self.assertEqual(service.db.get_campaign(1)["name"], "Updated purchase")
+
+    def test_purchase_counts_distinct_replies_and_selected_offers(self):
+        from webapp.purchases import filtered_purchases, purchase_rows
+        self.campaign(self.alice)
+        database = self.runtime.service(self.alice_id).db
+        with database.connect() as connection:
+            connection.execute("UPDATE campaigns SET status='active' WHERE id=1")
+        def incoming(uid, review=False, processed=True):
+            message, _ = database.insert_incoming(mailbox="alice@example.com", folder="INBOX", uid_validity="1",
+                imap_uid=uid, campaign_id=1, recipient_id=1, message_id=f"<reply{uid}@example.com>", in_reply_to="",
+                sender_email="supplier@example.com", subject="Reply", received_at=None,
+                body_text="Reply", raw_eml_path="", match_method="manual", needs_review=review)
+            if processed:
+                database.mark_incoming_complete(message)
+            return message
+        incoming(1)
+        incoming(2)
+        unprocessed = incoming(3, processed=False)
+        reviewed = incoming(4, review=True)
+        for message in (unprocessed, reviewed):
+            database.add_incoming_attachment(incoming_message_id=message, filename="quote.pdf", content_type="application/pdf",
+                size=1, sha256=str(message), path=f"quote{message}.pdf", is_allowed=True, duplicate_of_id=None)
+        row = purchase_rows(database)[0]
+        self.assertEqual((row["response_count"], row["offer_count"], row["display_status"]), (1, 0, "waiting"))
+        database.mark_incoming_complete(unprocessed)
+        row = purchase_rows(database)[0]
+        self.assertEqual((row["response_count"], row["offer_count"], row["display_status"]), (1, 1, "compare"))
+        self.assertEqual(len(filtered_purchases(database, "private", "compare")[0]), 1)
+        self.assertEqual(filtered_purchases(database, "missing", "all")[0], [])
+        self.assertEqual(filtered_purchases(database, "", "draft")[0], [])
+        service = self.runtime.service(self.alice_id)
+        with self.assertRaises(ValueError):
+            service.create_summary(1)
+        from types import SimpleNamespace
+        def build(request_path, sources, output):
+            self.assertEqual(len(sources), 1)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"generated comparison")
+            return SimpleNamespace(request_lines=[], allocations=[], issues=[])
+        response = self.post(self.alice, "/campaigns/1/summary")
+        self.assertEqual(response.status_code, 303)
+        self.assertTrue(response.headers["Location"].startswith("/campaigns/1?operation="))
+        with patch("automation.summary.build_summary", side_effect=build):
+            self.assertTrue(self.runtime.run_one(False))
+        job = self.store.jobs(self.alice_id)[0]
+        self.assertEqual(job["state"], "done")
+        result = json.loads(job["result"])
+        self.assertEqual(result["campaign_id"], 1)
+        file_url = "/files/" + result["file_id"]
+        self.assertIn(file_url, self.alice.get("/campaigns/1").data.decode())
+        self.assertEqual(self.bob.get(file_url).status_code, 404)
+
+    def test_operation_stays_on_related_page_and_is_private(self):
+        response = self.post(self.alice, "/operations/backup")
+        self.assertTrue(response.headers["Location"].startswith("/settings?operation="))
+        self.assertIn(b"data-operation-id", self.alice.get(response.headers["Location"]).data)
+        self.assertNotIn(b"data-operation-id", self.bob.get(response.headers["Location"]).data)
+        self.assertNotIn('>Задачи<', self.alice.get("/").data.decode())
 
     def test_upload_rejects_executable_and_large_request(self):
         self.supplier(self.alice)

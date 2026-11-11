@@ -56,6 +56,10 @@ class Store:
                     message TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '{}');
                 CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, created);
                 CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(user_id, created);
+                CREATE TABLE IF NOT EXISTS search_spend (
+                    job_id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
+                    cents INTEGER NOT NULL, state TEXT NOT NULL, created REAL NOT NULL,
+                    input_tokens INTEGER, output_tokens INTEGER, searches INTEGER);
             """)
 
     @contextmanager
@@ -165,6 +169,21 @@ class Store:
         with self.connect() as db:
             return db.execute("SELECT id,kind,state,created,updated,message,result FROM jobs "
                               "WHERE user_id=? ORDER BY created DESC LIMIT 100", (user_id,)).fetchall()
+
+    def reserve_search(self, job_id: str, user_id: str, limit_cents: int, amount: int):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            spent = db.execute("SELECT COALESCE(SUM(cents),0) FROM search_spend").fetchone()[0]
+            if limit_cents <= 0 or spent + amount > limit_cents:
+                return False
+            db.execute("INSERT INTO search_spend(job_id,user_id,cents,state,created) VALUES(?,?,?,'reserved',?)",
+                       (job_id, user_id, amount, time.time()))
+        return True
+
+    def settle_search(self, job_id: str, usage):
+        with self.connect() as db:
+            db.execute("UPDATE search_spend SET cents=?,state='estimated',input_tokens=?,output_tokens=?,searches=? "
+                       "WHERE job_id=?", (usage.estimated_cents, usage.input_tokens, usage.output_tokens, usage.searches, job_id))
 
 
 class EncryptedCredentials:
